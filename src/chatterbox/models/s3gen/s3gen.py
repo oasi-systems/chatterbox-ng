@@ -13,12 +13,13 @@
 # limitations under the License.
 
 import logging
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
 import torchaudio as ta
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Tuple
 
 from ..s3tokenizer import S3_SR, SPEECH_VOCAB_SIZE, S3Tokenizer
 from .const import S3GEN_SR
@@ -360,3 +361,83 @@ class S3Token2Wav(S3Token2Mel):
         output_wavs[:, :len(self.trim_fade)] *= self.trim_fade
 
         return output_wavs, output_sources
+
+    # ---- Streaming support ----
+
+    @dataclass
+    class StreamState:
+        """Mutable state for streaming inference."""
+        hifi_cache_source: torch.Tensor = None  # HiFiGAN source cache for continuity
+        prev_stable_mel_len: int = 0  # number of stable mel frames already emitted
+        is_first_chunk: bool = True
+
+    def init_streaming(self) -> 'S3Token2Wav.StreamState':
+        """Initialize streaming state. Call once before streaming tokens."""
+        return S3Token2Wav.StreamState(
+            hifi_cache_source=torch.zeros(1, 1, 0, device=self.device, dtype=self.dtype),
+            prev_stable_mel_len=0,
+            is_first_chunk=True,
+        )
+
+    @torch.inference_mode()
+    def streaming_step(
+        self,
+        all_tokens: torch.Tensor,
+        ref_dict: dict,
+        state: 'S3Token2Wav.StreamState',
+        finalize: bool = False,
+        n_cfm_timesteps: int = None,
+    ) -> Tuple[Optional[torch.Tensor], 'S3Token2Wav.StreamState']:
+        """Process accumulated tokens and return NEW audio (only the delta).
+
+        Args:
+            all_tokens: ALL speech tokens generated so far (1D or 2D tensor)
+            ref_dict: reference audio embeddings from embed_ref()
+            state: streaming state from init_streaming()
+            finalize: True when EOS reached (includes lookahead frames)
+            n_cfm_timesteps: CFM ODE steps (default: 2 for meanflow, 10 otherwise)
+
+        Returns:
+            (audio_chunk or None, updated_state)
+            audio_chunk is None if no new stable frames are available yet.
+        """
+        all_tokens = torch.atleast_2d(all_tokens)
+
+        # Generate mel for ALL accumulated tokens
+        output_mels = self.flow_inference(
+            speech_tokens=all_tokens,
+            ref_dict=ref_dict,
+            finalize=finalize,
+            n_cfm_timesteps=n_cfm_timesteps,
+        )
+        output_mels = output_mels.to(dtype=self.dtype)
+
+        total_mel_len = output_mels.shape[2]
+
+        # How many NEW stable mel frames do we have?
+        new_mel_len = total_mel_len - state.prev_stable_mel_len
+        if new_mel_len <= 0:
+            return None, state
+
+        # Extract only the NEW mel frames
+        new_mels = output_mels[:, :, state.prev_stable_mel_len:]
+
+        # Run HiFiGAN on new mel frames with cache for continuity
+        audio_chunk, new_source = self.mel2wav.inference(
+            speech_feat=new_mels,
+            cache_source=state.hifi_cache_source,
+        )
+
+        # Apply trim fade only on first chunk to reduce reference spillover
+        if state.is_first_chunk:
+            trim_len = min(len(self.trim_fade), audio_chunk.shape[1])
+            audio_chunk[:, :trim_len] *= self.trim_fade[:trim_len]
+
+        # Update state
+        # Keep last portion of source signal for cache continuity
+        cache_len = min(new_source.shape[2], S3GEN_SR // 10)  # ~100ms cache
+        state.hifi_cache_source = new_source[:, :, -cache_len:]
+        state.prev_stable_mel_len = total_mel_len
+        state.is_first_chunk = False
+
+        return audio_chunk, state

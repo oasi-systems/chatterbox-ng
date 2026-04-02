@@ -1,7 +1,7 @@
 [project]
-name = "chatterbox-tts"
-version = "0.1.7"
-description = "Chatterbox: Open Source TTS and Voice Conversion by Resemble AI"
+name = "chatterbox-ng"
+version = "0.2.0"
+description = "ChatterBox NG: Next Generation TTS with Italian support, true streaming, and audio post-processing. Fork of Chatterbox by Resemble AI."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
@@ -28,7 +28,8 @@ dependencies = [
     "pykakasi==2.3.0",
     "gradio==6.8.0",
     "pyloudnorm",
-    "omegaconf"
+    "omegaconf",
+    "num2words>=0.5.13",
 ]
 
 [project.urls]
