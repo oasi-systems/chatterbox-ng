@@ -212,6 +212,11 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
     ) -> Tuple[torch.Tensor, EncoderCaches]:
         """Encoder forward with KV-cache. Returns projected encoder output for new positions.
 
+        On the first call (empty cache), the encoder processes [prompt | speech] and
+        returns output for ALL positions. We strip the prompt portion so that only
+        speech mel frames are returned — matching flow.inference() which does
+        ``feat = feat[:, :, mel_len1:]``.
+
         Args:
             token: (B, n_speech_toks) — speech tokens (without prompt)
             token_len: (B,)
@@ -222,10 +227,11 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             encoder_caches: KV-cache state
 
         Returns:
-            new_h_proj: (B, new_mel_frames, 80) — projected encoder output for new positions
+            new_h_proj: (B, new_mel_frames, 80) — projected encoder output for NEW SPEECH positions only
             encoder_caches: updated caches
         """
         B = token.size(0)
+        is_first_call = encoder_caches.enc_cached_len == 0
 
         prompt_token = _repeat_batch_dim(prompt_token, B, ndim=2)
         prompt_token_len = _repeat_batch_dim(prompt_token_len, B, ndim=1)
@@ -243,6 +249,13 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         new_h, h_masks, encoder_caches = self.encoder.forward_cached(
             all_token_emb, all_token_len, encoder_caches
         )
+
+        # On first call, strip prompt mel frames from output.
+        # The encoder upsamples by token_mel_ratio, so prompt produces
+        # prompt_token_len * token_mel_ratio mel frames.
+        if is_first_call and new_h.size(1) > 0:
+            prompt_mel_len = int(prompt_token_len[0].item()) * self.token_mel_ratio
+            new_h = new_h[:, prompt_mel_len:]
 
         # Trim lookahead if not finalizing
         if finalize is False and new_h.size(1) > 0:
