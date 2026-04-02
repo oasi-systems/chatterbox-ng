@@ -49,54 +49,54 @@ SUPPORTED_LANGUAGES = {
 
 
 def punc_norm(text: str, language_id: str = None) -> str:
-    “””
+    """
         Quick cleanup func for punctuation from LLMs or
         containing chars not seen often in the dataset.
         Supports language-specific rules when language_id is provided.
-    “””
+    """
     if len(text) == 0:
-        if language_id == ‘it’:
-            return “Devi aggiungere del testo da leggere.”
-        return “You need to add some text for me to talk.”
+        if language_id == 'it':
+            return "Devi aggiungere del testo da leggere."
+        return "You need to add some text for me to talk."
 
     # Capitalise first letter
     if text[0].islower():
         text = text[0].upper() + text[1:]
 
     # Remove multiple space chars
-    text = “ “.join(text.split())
+    text = " ".join(text.split())
 
     # Replace uncommon/llm punc
     punc_to_replace = [
-        (“...”, “, “),
-        (“…”, “, “),
-        (“:”, “,”),
-        (“ - “, “, “),
-        (“;”, “, “),
-        (“—“, “-”),
-        (“–“, “-”),
-        (“ ,”, “,”),
-        (“””, “\””),
-        (“””, “\””),
-        (“’”, “’”),
-        (“’”, “’”),
+        ("...", ", "),
+        ("…", ", "),
+        (":", ","),
+        (" - ", ", "),
+        (";", ", "),
+        ("—", "-"),
+        ("–", "-"),
+        (" ,", ","),
+        ("\u201c", "\""),
+        ("\u201d", "\""),
+        ("\u2018", "'"),
+        ("\u2019", "'"),
     ]
 
     # Italian-specific: guillemets to double quotes
-    if language_id == ‘it’:
+    if language_id == 'it':
         punc_to_replace.extend([
-            (“«”, “\””),
-            (“»”, “\””),
+            ("«", "\""),
+            ("»", "\""),
         ])
 
     for old_char_sequence, new_char in punc_to_replace:
         text = text.replace(old_char_sequence, new_char)
 
     # Add full stop if no ending punc
-    text = text.rstrip(“ “)
-    sentence_enders = {“.”, “!”, “?”, “-”, “,”,”、”,”，”,”。”,”？”,”！”}
+    text = text.rstrip(" ")
+    sentence_enders = {".", "!", "?", "-", ",","、","，","。","？","！"}
     if not any(text.endswith(p) for p in sentence_enders):
-        text += “.”
+        text += "."
 
     return text
 

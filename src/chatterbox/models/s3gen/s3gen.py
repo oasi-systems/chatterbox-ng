@@ -314,7 +314,12 @@ class S3Token2Wav(S3Token2Mel):
         n_cfm_timesteps = n_cfm_timesteps or (2 if self.meanflow else 10)
         noise = None
         if self.meanflow:
-            noise = torch.randn(1, 80, speech_tokens.size(-1) * 2, dtype=self.dtype, device=self.device)
+            # When finalize=False, the encoder truncates by pre_lookahead_len * token_mel_ratio frames.
+            # We must match the noise size to the actual mel output, not the full token count.
+            mel_len = speech_tokens.size(-1) * 2
+            if not finalize:
+                mel_len -= self.flow.pre_lookahead_len * self.flow.token_mel_ratio
+            noise = torch.randn(1, 80, mel_len, dtype=self.dtype, device=self.device)
         output_mels = super().forward(
             speech_tokens, speech_token_lens=speech_token_lens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict,
             n_cfm_timesteps=n_cfm_timesteps, finalize=finalize, noised_mels=noise,
@@ -423,9 +428,15 @@ class S3Token2Wav(S3Token2Mel):
         new_mels = output_mels[:, :, state.prev_stable_mel_len:]
 
         # Run HiFiGAN on new mel frames with cache for continuity
+        # Estimate source length from mel frames to prevent cache overflow
+        # (HiFiGAN upsamples mel by 8*5*3=120x, so source_len ≈ mel_len * 120)
+        estimated_source_len = new_mels.shape[2] * 120
+        cache = state.hifi_cache_source
+        if cache.shape[2] > estimated_source_len:
+            cache = cache[:, :, -estimated_source_len:]
         audio_chunk, new_source = self.mel2wav.inference(
             speech_feat=new_mels,
-            cache_source=state.hifi_cache_source,
+            cache_source=cache,
         )
 
         # Apply trim fade only on first chunk to reduce reference spillover
