@@ -154,16 +154,18 @@ class AlignmentStreamAnalyzer:
             if len(self.generated_tokens) > 8:
                 self.generated_tokens = self.generated_tokens[-8:]
             
-        # Check for excessive token repetition (3x same token in a row)
+        # Check for excessive token repetition (4x same token in a row)
+        # NOTE: threshold was 2 in original code, but 2 is too aggressive for
+        # languages with geminate consonants (Italian, Japanese, etc.) where
+        # 2 consecutive identical tokens are normal speech patterns.
         token_repetition = (
-            # self.complete and 
-            len(self.generated_tokens) >= 3 and
-            len(set(self.generated_tokens[-2:])) == 1
+            len(self.generated_tokens) >= 4 and
+            len(set(self.generated_tokens[-4:])) == 1
         )
-        
+
         if token_repetition:
             repeated_token = self.generated_tokens[-1]
-            logger.warning(f"🚨 Detected 2x repetition of token {repeated_token}")
+            logger.warning(f"Detected 4x repetition of token {repeated_token}")
             
         # Suppress EoS to prevent early termination
         if cur_text_posn < S - 3 and S > 5:  # Only suppress if text is longer than 5 tokens

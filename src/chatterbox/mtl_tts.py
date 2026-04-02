@@ -265,7 +265,7 @@ class ChatterboxMultilingualTTS:
         exaggeration=0.5,
         cfg_weight=0.5,
         temperature=0.8,
-        repetition_penalty=2.0,
+        repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
     ):

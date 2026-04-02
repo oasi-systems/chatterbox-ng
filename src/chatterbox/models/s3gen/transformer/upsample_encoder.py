@@ -15,7 +15,8 @@
 # limitations under the License.
 # Modified from ESPnet(https://github.com/espnet/espnet)
 """Encoder definition."""
-from typing import Tuple
+from dataclasses import dataclass, field
+from typing import Tuple, Optional, List
 
 import torch
 from torch import nn
@@ -94,6 +95,18 @@ class PreLookaheadLayer(nn.Module):
         # residual connection
         outputs = outputs + inputs
         return outputs
+
+
+@dataclass
+class EncoderCaches:
+    """KV-cache state for streaming encoder inference."""
+    enc_att: List[torch.Tensor] = field(default_factory=list)   # per-layer att cache
+    enc_cnn: List[torch.Tensor] = field(default_factory=list)   # per-layer cnn cache
+    up_att: List[torch.Tensor] = field(default_factory=list)    # per-layer up-encoder att cache
+    up_cnn: List[torch.Tensor] = field(default_factory=list)    # per-layer up-encoder cnn cache
+    enc_cached_len: int = 0      # cached positions in main encoder
+    up_cached_len: int = 0       # cached positions in up-encoder
+    enc_output_cache: Optional[torch.Tensor] = None  # (B, cached_len, D) stage-1 output
 
 
 class UpsampleConformerEncoder(torch.nn.Module):
@@ -316,3 +329,146 @@ class UpsampleConformerEncoder(torch.nn.Module):
         for layer in self.up_encoders:
             xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
         return xs
+
+    def init_caches(self, device: torch.device, dtype: torch.dtype) -> EncoderCaches:
+        """Initialize empty encoder caches for streaming."""
+        zero4 = lambda: torch.zeros(0, 0, 0, 0, device=device, dtype=dtype)
+        return EncoderCaches(
+            enc_att=[zero4() for _ in self.encoders],
+            enc_cnn=[zero4() for _ in self.encoders],
+            up_att=[zero4() for _ in self.up_encoders],
+            up_cnn=[zero4() for _ in self.up_encoders],
+            enc_cached_len=0,
+            up_cached_len=0,
+            enc_output_cache=None,
+        )
+
+    def forward_cached(
+        self,
+        xs: torch.Tensor,
+        xs_lens: torch.Tensor,
+        caches: EncoderCaches,
+    ) -> Tuple[torch.Tensor, torch.Tensor, EncoderCaches]:
+        """Encoder forward with KV-cache for streaming.
+
+        Runs embed + PreLookaheadLayer on the full sequence (cheap O(N)),
+        then processes only NEW positions through attention layers using
+        cached K/V from previous chunks.
+
+        Args:
+            xs: (B, T_full, D) — full token embeddings (all accumulated tokens)
+            xs_lens: (B,) — sequence lengths
+            caches: EncoderCaches from previous chunk (or init_caches())
+
+        Returns:
+            new_output: (B, new_up_len, D) — encoder output for new positions only
+            masks: (B, 1, total_up_len) — full output masks
+            caches: updated EncoderCaches
+        """
+        T = xs.size(1)
+        masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)  # (B, 1, T)
+
+        if self.global_cmvn is not None:
+            xs = self.global_cmvn(xs)
+
+        # Embed + PreLookaheadLayer on FULL sequence (O(N), cheap)
+        xs, pos_emb_full, masks = self.embed(xs, masks)
+        xs = self.pre_lookahead_layer(xs)
+
+        # --- Stage 1: Main encoder layers with KV-cache ---
+        new_len = T - caches.enc_cached_len
+        new_xs = xs[:, caches.enc_cached_len:]  # only new positions
+
+        # Positional encoding for asymmetric Q(new) / K(all) attention
+        pos_enc = self.embed.pos_enc
+        if caches.enc_cached_len > 0:
+            pos_emb = pos_enc.position_encoding_cached(
+                query_len=new_len, key_len=T
+            )
+        else:
+            pos_emb = pos_emb_full
+
+        # Mask: new queries can attend to all positions
+        mask_new = torch.ones(1, new_len, T, dtype=torch.bool, device=xs.device)
+        mask_pad_new = torch.ones(1, 1, new_len, dtype=torch.bool, device=xs.device)
+
+        new_enc_att = []
+        new_enc_cnn = []
+        for i, layer in enumerate(self.encoders):
+            att_c = caches.enc_att[i] if i < len(caches.enc_att) else torch.zeros(0, 0, 0, 0, device=xs.device)
+            cnn_c = caches.enc_cnn[i] if i < len(caches.enc_cnn) else torch.zeros(0, 0, 0, 0, device=xs.device)
+            new_xs, mask_new, new_att_c, new_cnn_c = layer(
+                new_xs, mask_new, pos_emb, mask_pad_new, att_c, cnn_c
+            )
+            new_enc_att.append(new_att_c)
+            new_enc_cnn.append(new_cnn_c)
+
+        # --- Stage 2: Upsample ---
+        # Upsampler Conv1d(kernel=5, left-pad=4) needs context from previous output.
+        # Prepend last few cached output frames for correct boundary.
+        if caches.enc_output_cache is not None:
+            # Need ceil(kernel_size / stride) = ceil(5/2) = 3 pre-upsample frames as context
+            ctx_len = min(3, caches.enc_output_cache.size(1))
+            ctx = caches.enc_output_cache[:, -ctx_len:]
+            up_input = torch.cat([ctx, new_xs], dim=1)
+        else:
+            ctx_len = 0
+            up_input = new_xs
+
+        up_input_t = up_input.transpose(1, 2).contiguous()  # (B, D, ctx+new)
+        up_lens = torch.tensor([up_input.size(1)], device=xs.device)
+        up_output, up_out_lens = self.up_layer(up_input_t, up_lens)
+        up_output = up_output.transpose(1, 2).contiguous()  # (B, 2*(ctx+new), D)
+
+        # Remove context frames from upsampled output (they were just for Conv1d boundary)
+        up_ctx_frames = ctx_len * self.up_layer.stride  # 2x upsampled context
+        new_up = up_output[:, up_ctx_frames:]  # only new upsampled frames
+        new_up_len = new_up.size(1)
+
+        # Update cached encoder output (pre-upsample, for next chunk's context)
+        if caches.enc_output_cache is not None:
+            caches.enc_output_cache = torch.cat([caches.enc_output_cache, new_xs], dim=1)
+        else:
+            caches.enc_output_cache = new_xs
+
+        # --- Stage 3: Up-encoder layers with KV-cache ---
+        total_up_len = caches.up_cached_len + new_up_len
+        up_masks = torch.ones(1, 1, total_up_len, dtype=torch.bool, device=xs.device)
+
+        # Embed upsampled features (re-embed for pos encoding)
+        up_mask_for_embed = torch.ones(1, 1, new_up_len, dtype=torch.bool, device=xs.device)
+        new_up, up_pos_emb, _ = self.up_embed(new_up, up_mask_for_embed)
+
+        # Positional encoding for asymmetric attention
+        up_pos_enc = self.up_embed.pos_enc
+        if caches.up_cached_len > 0:
+            up_pos_emb = up_pos_enc.position_encoding_cached(
+                query_len=new_up_len, key_len=total_up_len
+            )
+
+        up_mask_attn = torch.ones(1, new_up_len, total_up_len, dtype=torch.bool, device=xs.device)
+        up_mask_pad = torch.ones(1, 1, new_up_len, dtype=torch.bool, device=xs.device)
+
+        new_up_att = []
+        new_up_cnn = []
+        for i, layer in enumerate(self.up_encoders):
+            att_c = caches.up_att[i] if i < len(caches.up_att) else torch.zeros(0, 0, 0, 0, device=xs.device)
+            cnn_c = caches.up_cnn[i] if i < len(caches.up_cnn) else torch.zeros(0, 0, 0, 0, device=xs.device)
+            new_up, up_mask_attn, new_att_c, new_cnn_c = layer(
+                new_up, up_mask_attn, up_pos_emb, up_mask_pad, att_c, cnn_c
+            )
+            new_up_att.append(new_att_c)
+            new_up_cnn.append(new_cnn_c)
+
+        if self.normalize_before:
+            new_up = self.after_norm(new_up)
+
+        # Update caches
+        caches.enc_att = new_enc_att
+        caches.enc_cnn = new_enc_cnn
+        caches.up_att = new_up_att
+        caches.up_cnn = new_up_cnn
+        caches.enc_cached_len = T
+        caches.up_cached_len = total_up_len
+
+        return new_up, up_masks, caches

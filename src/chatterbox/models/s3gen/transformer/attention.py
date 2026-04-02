@@ -225,25 +225,26 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
     def rel_shift(self, x: torch.Tensor) -> torch.Tensor:
         """Compute relative positional encoding.
 
+        Supports asymmetric query/key lengths for KV-cache streaming.
+        When using cache: pos_len = query_len + key_len - 1 (not 2*query_len - 1).
+
         Args:
-            x (torch.Tensor): Input tensor (batch, head, time1, 2*time1-1).
-            time1 means the length of query vector.
+            x (torch.Tensor): Input tensor (batch, head, qlen, pos_len).
+                pos_len = qlen + klen - 1 where klen is the total key length.
 
         Returns:
-            torch.Tensor: Output tensor.
-
+            torch.Tensor: Output tensor (batch, head, qlen, klen).
         """
-        zero_pad = torch.zeros((x.size()[0], x.size()[1], x.size()[2], 1),
-                               device=x.device,
-                               dtype=x.dtype)
-        x_padded = torch.cat([zero_pad, x], dim=-1)
+        b, h, qlen, pos_len = x.size()
+        zero_pad = torch.zeros((b, h, qlen, 1), device=x.device, dtype=x.dtype)
+        x_padded = torch.cat([zero_pad, x], dim=-1)  # (b, h, qlen, pos_len+1)
 
-        x_padded = x_padded.view(x.size()[0],
-                                 x.size()[1],
-                                 x.size(3) + 1, x.size(2))
-        x = x_padded[:, :, 1:].view_as(x)[
-            :, :, :, : x.size(-1) // 2 + 1
-        ]  # only keep the positions from 0 to time2
+        x_padded = x_padded.view(b, h, pos_len + 1, qlen)
+        x = x_padded[:, :, 1:].reshape(b, h, qlen, pos_len)
+        # klen = pos_len + 1 - qlen: works for both symmetric (klen=qlen) and
+        # asymmetric (klen=cached+qlen) cases.
+        klen = pos_len + 1 - qlen
+        x = x[:, :, :, :klen]
         return x
 
     def forward(

@@ -75,7 +75,7 @@ class ConditionalCFM(BASECFM):
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
         return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), flow_cache
 
-    def solve_euler(self, x, t_span, mu, mask, spks, cond, meanflow=False):
+    def solve_euler(self, x, t_span, mu, mask, spks, cond, meanflow=False, freeze_len=0):
         """
         Fixed euler solver for ODEs.
         Args:
@@ -90,9 +90,15 @@ class ConditionalCFM(BASECFM):
                 shape: (batch_size, spk_emb_dim)
             cond: Not used but kept for future purposes
             meanflow: meanflow mode
+            freeze_len: number of leading frames to freeze after each ODE step.
+                Used for context-window streaming: context frames are reset to
+                their initial values (cached mel) after each step.
         """
         in_dtype = x.dtype
         x, t_span, mu, mask, spks, cond = cast_all(x, t_span, mu, mask, spks, cond, dtype=self.estimator.dtype)
+
+        # Save frozen context before ODE iteration
+        frozen_context = x[:, :, :freeze_len].clone() if freeze_len > 0 else None
 
         # Duplicated batch dims are for CFG
         # Do not use concat, it may cause memory format changed and trt infer with wrong results!
@@ -108,21 +114,6 @@ class ConditionalCFM(BASECFM):
         for t, r in zip(t_span[:-1], t_span[1:]):
             t = t.unsqueeze(dim=0)
             r = r.unsqueeze(dim=0)
-            # Shapes:
-            #      x_in  ( 2B, 80, T )
-            #   mask_in  ( 2B,  1, T )
-            #     mu_in  ( 2B, 80, T )
-            #      t_in  ( 2B,       )
-            #   spks_in  ( 2B, 80,   )
-            #   cond_in  ( 2B, 80, T )
-            #      r_in  ( 2B,       )
-            #         x  (  B, 80, T )
-            #      mask  (  B,  1, T )
-            #        mu  (  B, 80, T )
-            #         t  (  B,       )
-            #      spks  (  B, 80,   )
-            #      cond  (  B, 80, T )
-            #         r  (  B,       )
 
             x_in[:B] = x_in[B:] = x
             mask_in[:B] = mask_in[B:] = mask
@@ -140,7 +131,9 @@ class ConditionalCFM(BASECFM):
             dt = r - t
             x = x + dt * dxdt
 
-
+            # Freeze context frames — reset to cached mel values
+            if frozen_context is not None:
+                x[:, :, :freeze_len] = frozen_context
 
         return x.to(in_dtype)
 
@@ -193,7 +186,8 @@ class CausalConditionalCFM(ConditionalCFM):
         self.rand_noise = None
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, noised_mels=None, meanflow=False):
+    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None,
+                noised_mels=None, meanflow=False, freeze_len=0):
         """Forward diffusion
 
         Args:
@@ -207,6 +201,7 @@ class CausalConditionalCFM(ConditionalCFM):
                 shape: (batch_size, spk_emb_dim)
             cond: Not used but kept for future purposes
             noised_mels: gt mels noised a time t
+            freeze_len: number of leading frames to freeze during ODE (context window)
         Returns:
             sample: generated mel-spectrogram
                 shape: (batch_size, n_feats, mel_timesteps)
@@ -228,13 +223,15 @@ class CausalConditionalCFM(ConditionalCFM):
         #   because they were distilled with CFG outputs. We would need to add another hparam and
         #   change the conditional logic here if we want to use CFG inference with a meanflow model.
         if meanflow:
-            return self.basic_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
+            return self.basic_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, freeze_len=freeze_len), None
 
-        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, meanflow=meanflow), None
+        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, meanflow=meanflow, freeze_len=freeze_len), None
 
-    def basic_euler(self, x, t_span, mu, mask, spks, cond):
+    def basic_euler(self, x, t_span, mu, mask, spks, cond, freeze_len=0):
         in_dtype = x.dtype
         x, t_span, mu, mask, spks, cond = cast_all(x, t_span, mu, mask, spks, cond, dtype=self.estimator.dtype)
+
+        frozen_context = x[:, :, :freeze_len].clone() if freeze_len > 0 else None
 
         print("S3 Token -> Mel Inference...")
         for t, r in tqdm(zip(t_span[..., :-1], t_span[..., 1:]), total=t_span.shape[-1] - 1):
@@ -242,5 +239,7 @@ class CausalConditionalCFM(ConditionalCFM):
             dxdt = self.estimator.forward(x, mask=mask, mu=mu, t=t, spks=spks, cond=cond, r=r)
             dt = r - t
             x = x + dt * dxdt
+            if frozen_context is not None:
+                x[:, :, :freeze_len] = frozen_context
 
         return x.to(in_dtype)

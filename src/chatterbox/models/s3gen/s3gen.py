@@ -24,6 +24,7 @@ from typing import Optional, Tuple
 from ..s3tokenizer import S3_SR, SPEECH_VOCAB_SIZE, S3Tokenizer
 from .const import S3GEN_SR
 from .flow import CausalMaskedDiffWithXvec
+from .transformer.upsample_encoder import EncoderCaches
 from .xvector import CAMPPlus
 from .utils.mel import mel_spectrogram
 from .f0_predictor import ConvRNNF0Predictor
@@ -375,6 +376,13 @@ class S3Token2Wav(S3Token2Mel):
         hifi_cache_source: torch.Tensor = None  # HiFiGAN source cache for continuity
         prev_stable_mel_len: int = 0  # number of stable mel frames already emitted
         is_first_chunk: bool = True
+        # Encoder KV-cache
+        encoder_caches: EncoderCaches = None
+        # Cached outputs for context window
+        cached_encoder_output: torch.Tensor = None  # (B, accumulated_mel_frames, 80) projected
+        cached_mel: torch.Tensor = None             # (B, 80, accumulated_mel_frames) generated mel
+        # Projected speaker embedding (cached after first chunk)
+        spk_embedding_proj: torch.Tensor = None     # (B, 80) projected
 
     def init_streaming(self) -> 'S3Token2Wav.StreamState':
         """Initialize streaming state. Call once before streaming tokens."""
@@ -382,6 +390,7 @@ class S3Token2Wav(S3Token2Mel):
             hifi_cache_source=torch.zeros(1, 1, 0, device=self.device, dtype=self.dtype),
             prev_stable_mel_len=0,
             is_first_chunk=True,
+            encoder_caches=self.flow.encoder.init_caches(self.device, self.dtype),
         )
 
     @torch.inference_mode()
@@ -449,6 +458,143 @@ class S3Token2Wav(S3Token2Mel):
         cache_len = min(new_source.shape[2], S3GEN_SR // 10)  # ~100ms cache
         state.hifi_cache_source = new_source[:, :, -cache_len:]
         state.prev_stable_mel_len = total_mel_len
+        state.is_first_chunk = False
+
+        return audio_chunk, state
+
+    @torch.inference_mode()
+    def streaming_step_cached(
+        self,
+        all_tokens: torch.Tensor,
+        ref_dict: dict,
+        state: 'S3Token2Wav.StreamState',
+        finalize: bool = False,
+        n_cfm_timesteps: int = None,
+        context_frames: int = 20,
+    ) -> Tuple[Optional[torch.Tensor], 'S3Token2Wav.StreamState']:
+        """Process accumulated tokens with encoder KV-cache and CFM context window.
+
+        Instead of re-encoding all tokens and running CFM on the full sequence,
+        this method:
+        1. Encoder: only processes NEW tokens via KV-cache (saves encoder recomputation)
+        2. CFM: runs ODE on [context_window | new_frames] with frozen context (saves CFM cost)
+
+        Args:
+            all_tokens: ALL speech tokens generated so far (1D or 2D tensor)
+            ref_dict: reference audio embeddings from embed_ref()
+            state: streaming state from init_streaming()
+            finalize: True when EOS reached
+            n_cfm_timesteps: CFM ODE steps
+            context_frames: number of mel frames to use as frozen context for CFM
+
+        Returns:
+            (audio_chunk or None, updated_state)
+        """
+        n_cfm_timesteps = n_cfm_timesteps or (2 if self.meanflow else 10)
+        all_tokens = torch.atleast_2d(all_tokens)
+
+        # Prepare prompt tokens and speaker embedding (from ref_dict)
+        prompt_token = ref_dict['prompt_token'].to(self.device, dtype=torch.long)
+        prompt_token_len = ref_dict['prompt_token_len'].to(self.device)
+        embedding = ref_dict['embedding'].to(self.device, dtype=self.dtype)
+
+        # Project speaker embedding once and cache it
+        if state.spk_embedding_proj is None:
+            embedding = torch.atleast_2d(embedding)
+            embedding = torch.nn.functional.normalize(embedding, dim=1)
+            state.spk_embedding_proj = self.flow.spk_embed_affine_layer(embedding)
+
+        speech_token_lens = torch.LongTensor([all_tokens.size(-1)]).to(self.device)
+
+        # --- Step 1: Encoder with KV-cache ---
+        new_h_proj, state.encoder_caches = self.flow.inference_cached(
+            token=all_tokens,
+            token_len=speech_token_lens,
+            prompt_token=prompt_token,
+            prompt_token_len=prompt_token_len,
+            embedding=state.spk_embedding_proj,
+            finalize=finalize,
+            encoder_caches=state.encoder_caches,
+        )
+
+        if new_h_proj.size(1) == 0:
+            return None, state
+
+        new_h_proj = new_h_proj.to(dtype=self.dtype)
+
+        # Accumulate encoder output
+        if state.cached_encoder_output is not None:
+            state.cached_encoder_output = torch.cat(
+                [state.cached_encoder_output, new_h_proj], dim=1
+            )
+        else:
+            state.cached_encoder_output = new_h_proj
+
+        # --- Step 2: CFM with context window ---
+        new_mel_frames = new_h_proj.size(1)
+        actual_context = 0
+
+        if state.cached_mel is not None and context_frames > 0:
+            actual_context = min(context_frames, state.cached_mel.size(2))
+            context_mel = state.cached_mel[:, :, -actual_context:]
+            context_mu = state.cached_encoder_output[:, -(new_mel_frames + actual_context):-new_mel_frames]
+            context_mu = context_mu.transpose(1, 2).contiguous()  # (B, 80, ctx)
+        else:
+            context_mel = None
+            context_mu = None
+
+        new_mu = new_h_proj.transpose(1, 2).contiguous()  # (B, 80, new_frames)
+
+        if context_mu is not None:
+            mu_windowed = torch.cat([context_mu, new_mu], dim=2)
+        else:
+            mu_windowed = new_mu
+            context_mel = torch.zeros(1, 80, 0, device=self.device, dtype=self.dtype)
+
+        # For meanflow, generate matching noise
+        noise = None
+        if self.meanflow:
+            noise = torch.randn(1, 80, mu_windowed.size(2), dtype=self.dtype, device=self.device)
+            if actual_context > 0:
+                noise[:, :, :actual_context] = context_mel
+
+        new_mel = self.flow.inference_windowed(
+            mu_windowed=mu_windowed,
+            context_mel=context_mel if actual_context > 0 else torch.zeros(1, 80, 0, device=self.device, dtype=self.dtype),
+            embedding=state.spk_embedding_proj,
+            context_frames=actual_context,
+            n_timesteps=n_cfm_timesteps,
+            meanflow=self.meanflow,
+        )
+
+        new_mel = new_mel.to(dtype=self.dtype)
+
+        # Accumulate generated mel
+        if state.cached_mel is not None:
+            state.cached_mel = torch.cat([state.cached_mel, new_mel], dim=2)
+        else:
+            state.cached_mel = new_mel
+
+        # --- Step 3: HiFiGAN vocoding ---
+        estimated_source_len = new_mel.shape[2] * 120
+        cache = state.hifi_cache_source
+        if cache.shape[2] > estimated_source_len:
+            cache = cache[:, :, -estimated_source_len:]
+
+        audio_chunk, new_source = self.mel2wav.inference(
+            speech_feat=new_mel,
+            cache_source=cache,
+        )
+
+        # Apply trim fade on first chunk
+        if state.is_first_chunk:
+            trim_len = min(len(self.trim_fade), audio_chunk.shape[1])
+            audio_chunk[:, :trim_len] *= self.trim_fade[:trim_len]
+
+        # Update state
+        cache_len = min(new_source.shape[2], S3GEN_SR // 10)
+        state.hifi_cache_source = new_source[:, :, -cache_len:]
+        state.prev_stable_mel_len += new_mel.size(2)
         state.is_first_chunk = False
 
         return audio_chunk, state

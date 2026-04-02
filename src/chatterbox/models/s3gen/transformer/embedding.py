@@ -292,3 +292,24 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
             self.pe.size(1) // 2 - size + 1: self.pe.size(1) // 2 + size,
         ]
         return pos_emb
+
+    def position_encoding_cached(self, query_len: int, key_len: int) -> torch.Tensor:
+        """Positional encoding for cached attention with asymmetric Q/K lengths.
+
+        When using KV-cache, queries have length `query_len` (new positions only)
+        while keys have length `key_len` (cached + new positions).
+        Relative distances range from -(key_len-1) to +(query_len-1).
+
+        Falls back to standard encoding when query_len == key_len.
+
+        Args:
+            query_len: number of query positions (new chunk)
+            key_len: total number of key positions (cached + new)
+
+        Returns:
+            torch.Tensor: pos_emb of shape (1, query_len + key_len - 1, d_model)
+        """
+        center = self.pe.size(1) // 2
+        start = center - query_len + 1
+        end = center + key_len
+        return self.pe[:, start:end]

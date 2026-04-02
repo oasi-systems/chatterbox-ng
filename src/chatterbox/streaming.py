@@ -64,16 +64,20 @@ class ChatterboxStreamingTTS:
         model,
         chunk_tokens: int = 25,
         min_initial_tokens: int = 15,
+        streaming_cfm_steps: int = 4,
     ):
         """
         Args:
             model: ChatterboxTTS, ChatterboxMultilingualTTS, or ChatterboxTurboTTS instance
             chunk_tokens: number of speech tokens to buffer before emitting audio (~40ms per token)
             min_initial_tokens: minimum tokens before first audio emission (higher = better first-chunk quality)
+            streaming_cfm_steps: CFM ODE steps for intermediate chunks (fewer = faster, lower quality).
+                Final chunk always uses full steps. Set to None to use model default.
         """
         self.model = model
         self.chunk_tokens = chunk_tokens
         self.min_initial_tokens = min_initial_tokens
+        self.streaming_cfm_steps = streaming_cfm_steps
         self.sample_rate = S3GEN_SR
         self._all_chunks = []
         self._watermarker = perth.PerthImplicitWatermarker()
@@ -148,8 +152,9 @@ class ChatterboxStreamingTTS:
         top_k: int = 1000,
         # S3Gen params
         n_cfm_timesteps: Optional[int] = None,
-        # Pipelining
-        sentence_pipelining: bool = False,
+        # Pipelining — always enabled for quality and stability.
+        # The growing-sequence mode degrades on long texts (CFM artifacts).
+        sentence_pipelining: bool = True,
     ) -> Generator[np.ndarray, None, None]:
         """Stream audio chunks as speech tokens are generated.
 
@@ -300,6 +305,13 @@ class ChatterboxStreamingTTS:
             # but audio waveform stays continuous via HiFiGAN cache
             if not is_last_sentence:
                 stream_state.prev_stable_mel_len = 0
+                # Reset encoder caches and cached outputs for fresh sentence encoding
+                if hasattr(stream_state, 'encoder_caches') and stream_state.encoder_caches is not None:
+                    stream_state.encoder_caches = self.model.s3gen.flow.encoder.init_caches(
+                        self.model.device, next(self.model.s3gen.parameters()).dtype
+                    )
+                    stream_state.cached_encoder_output = None
+                    stream_state.cached_mel = None
 
     def _emit_chunk(
         self,
@@ -308,21 +320,44 @@ class ChatterboxStreamingTTS:
         finalize: bool,
         n_cfm_timesteps: Optional[int],
     ) -> Optional[np.ndarray]:
-        """Run S3Gen on accumulated tokens and return new audio."""
+        """Run S3Gen on accumulated tokens and return new audio.
+
+        Uses encoder KV-cache + CFM context window for O(chunk) cost per chunk
+        instead of O(N) re-processing. Falls back to full reprocessing if
+        encoder_caches is not available on the state.
+
+        Uses reduced ODE steps for intermediate chunks (streaming_cfm_steps)
+        and full steps for the final chunk, balancing latency and quality.
+        """
         all_tokens = torch.cat(accumulated_tokens, dim=0).unsqueeze(0).to(self.model.device)
 
-        audio_chunk, updated_state = self.model.s3gen.streaming_step(
-            all_tokens=all_tokens,
-            ref_dict=self.model.conds.gen,
-            state=stream_state,
-            finalize=finalize,
-            n_cfm_timesteps=n_cfm_timesteps,
-        )
+        # Use fewer ODE steps for intermediate chunks to reduce latency
+        effective_steps = n_cfm_timesteps
+        if effective_steps is None and not finalize and self.streaming_cfm_steps is not None:
+            effective_steps = self.streaming_cfm_steps
 
-        # Update state in-place
-        stream_state.hifi_cache_source = updated_state.hifi_cache_source
-        stream_state.prev_stable_mel_len = updated_state.prev_stable_mel_len
-        stream_state.is_first_chunk = updated_state.is_first_chunk
+        # Use cached path if encoder caches are available
+        if hasattr(stream_state, 'encoder_caches') and stream_state.encoder_caches is not None:
+            audio_chunk, updated_state = self.model.s3gen.streaming_step_cached(
+                all_tokens=all_tokens,
+                ref_dict=self.model.conds.gen,
+                state=stream_state,
+                finalize=finalize,
+                n_cfm_timesteps=effective_steps,
+                context_frames=20,
+            )
+        else:
+            audio_chunk, updated_state = self.model.s3gen.streaming_step(
+                all_tokens=all_tokens,
+                ref_dict=self.model.conds.gen,
+                state=stream_state,
+                finalize=finalize,
+                n_cfm_timesteps=effective_steps,
+            )
+
+        # Update state in-place (copy all fields from updated state)
+        for attr in vars(updated_state):
+            setattr(stream_state, attr, getattr(updated_state, attr))
 
         if audio_chunk is None:
             return None

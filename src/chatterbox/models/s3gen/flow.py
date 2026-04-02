@@ -13,7 +13,7 @@
 # limitations under the License.
 import logging
 import random
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 import torch
@@ -21,6 +21,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from .utils.mask import make_pad_mask
 from .configs import CFM_PARAMS
+from .transformer.upsample_encoder import EncoderCaches
 from omegaconf import DictConfig
 
 
@@ -197,3 +198,114 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
         return feat, None  # NOTE jrm: why are they returning None here?
+
+    @torch.inference_mode()
+    def inference_cached(
+        self,
+        token: torch.Tensor,
+        token_len: torch.Tensor,
+        prompt_token: torch.Tensor,
+        prompt_token_len: torch.Tensor,
+        embedding: torch.Tensor,
+        finalize: bool,
+        encoder_caches: EncoderCaches,
+    ) -> Tuple[torch.Tensor, EncoderCaches]:
+        """Encoder forward with KV-cache. Returns projected encoder output for new positions.
+
+        Args:
+            token: (B, n_speech_toks) — speech tokens (without prompt)
+            token_len: (B,)
+            prompt_token: (B, n_prompt)
+            prompt_token_len: (B,)
+            embedding: (1 or B, spk_dim) — speaker embedding (already projected)
+            finalize: whether EOS reached
+            encoder_caches: KV-cache state
+
+        Returns:
+            new_h_proj: (B, new_mel_frames, 80) — projected encoder output for new positions
+            encoder_caches: updated caches
+        """
+        B = token.size(0)
+
+        prompt_token = _repeat_batch_dim(prompt_token, B, ndim=2)
+        prompt_token_len = _repeat_batch_dim(prompt_token_len, B, ndim=1)
+
+        # Full token sequence: [prompt | speech]
+        all_token = torch.concat([prompt_token, token], dim=1)
+        all_token_len = prompt_token_len + token_len
+        mask = (~make_pad_mask(all_token_len)).unsqueeze(-1).to(embedding)
+
+        if (all_token >= self.vocab_size).any():
+            logger.error(f"{all_token.max()}>{self.vocab_size}\n out-of-range special tokens found in flow, fix inputs!")
+        all_token_emb = self.input_embedding(all_token.long()) * mask
+
+        # Encoder with KV-cache: embed+PreLookaheadLayer on full, attention on new only
+        new_h, h_masks, encoder_caches = self.encoder.forward_cached(
+            all_token_emb, all_token_len, encoder_caches
+        )
+
+        # Trim lookahead if not finalizing
+        if finalize is False and new_h.size(1) > 0:
+            trim = self.pre_lookahead_len * self.token_mel_ratio
+            if new_h.size(1) > trim:
+                new_h = new_h[:, :-trim]
+
+        new_h_proj = self.encoder_proj(new_h)  # (B, new_mel, 80)
+        return new_h_proj, encoder_caches
+
+    @torch.inference_mode()
+    def inference_windowed(
+        self,
+        mu_windowed: torch.Tensor,
+        context_mel: torch.Tensor,
+        embedding: torch.Tensor,
+        context_frames: int,
+        n_timesteps: int = 10,
+        meanflow: bool = False,
+    ) -> torch.Tensor:
+        """CFM inference with context window (cache-and-freeze).
+
+        Runs ODE on [context_mel | noise_for_new] with context frames frozen
+        after each ODE step. Only returns mel for new frames.
+
+        Args:
+            mu_windowed: (B, 80, context_frames + new_frames) — encoder output for window
+            context_mel: (B, 80, context_frames) — cached mel to use as frozen context
+            embedding: (B, 80) — projected speaker embedding
+            context_frames: number of leading frames to freeze
+            n_timesteps: ODE steps
+            meanflow: whether to use meanflow mode
+
+        Returns:
+            new_mel: (B, 80, new_frames) — generated mel for new positions only
+        """
+        B = mu_windowed.size(0)
+        total_frames = mu_windowed.size(2)
+
+        # Build initial z: [context_mel | random_noise]
+        # Pass as noised_mels covering entire sequence so CausalConditionalCFM
+        # replaces its own randn with our initialization
+        z_init = torch.randn(B, 80, total_frames, device=mu_windowed.device, dtype=mu_windowed.dtype)
+        if context_frames > 0:
+            z_init[:, :, :context_frames] = context_mel
+
+        # Conditioning: zeros (no prompt feat in windowed mode, style from spks)
+        conds = torch.zeros(B, 80, total_frames, device=mu_windowed.device, dtype=mu_windowed.dtype)
+
+        # Mask: all valid
+        mask = torch.ones(B, 1, total_frames, device=mu_windowed.device, dtype=mu_windowed.dtype)
+
+        # Run CFM decoder with freeze — noised_mels=z_init replaces the full z
+        feat, _ = self.decoder(
+            mu=mu_windowed,
+            mask=mask,
+            spks=embedding,
+            cond=conds,
+            n_timesteps=n_timesteps,
+            noised_mels=z_init,
+            meanflow=meanflow,
+            freeze_len=context_frames,
+        )
+
+        # Extract only new frames
+        return feat[:, :, context_frames:]
