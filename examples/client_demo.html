@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<title>ChatterBox NG — Live TTS</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, system-ui, sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; display: flex; justify-content: center; align-items: center; }
+.container { width: 480px; padding: 40px; }
+h1 { font-size: 1.4em; font-weight: 300; margin-bottom: 8px; color: #fff; }
+.subtitle { color: #666; font-size: 0.85em; margin-bottom: 32px; }
+label { display: block; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.1em; color: #555; margin-bottom: 6px; margin-top: 20px; }
+textarea { width: 100%; height: 80px; background: #151515; border: 1px solid #222; border-radius: 8px; color: #fff; padding: 12px; font-size: 1em; resize: vertical; font-family: inherit; }
+textarea:focus { outline: none; border-color: #444; }
+select, input[type=text] { width: 100%; background: #151515; border: 1px solid #222; border-radius: 8px; color: #fff; padding: 10px 12px; font-size: 0.95em; }
+.row { display: flex; gap: 12px; }
+.row > div { flex: 1; }
+button { width: 100%; margin-top: 28px; padding: 14px; background: #fff; color: #000; border: none; border-radius: 8px; font-size: 1em; font-weight: 500; cursor: pointer; transition: all 0.15s; }
+button:hover { background: #ddd; }
+button:disabled { background: #333; color: #666; cursor: not-allowed; }
+button.streaming { background: #e74c3c; color: #fff; }
+.metrics { margin-top: 24px; padding: 16px; background: #111; border-radius: 8px; font-family: 'SF Mono', monospace; font-size: 0.8em; line-height: 1.8; color: #888; display: none; }
+.metrics .value { color: #4ecdc4; }
+.wave { height: 40px; margin-top: 20px; display: flex; align-items: center; justify-content: center; gap: 3px; display: none; }
+.wave.active { display: flex; }
+.wave span { display: inline-block; width: 3px; background: #4ecdc4; border-radius: 2px; animation: wave 0.8s ease-in-out infinite; }
+.wave span:nth-child(2) { animation-delay: 0.1s; }
+.wave span:nth-child(3) { animation-delay: 0.2s; }
+.wave span:nth-child(4) { animation-delay: 0.3s; }
+.wave span:nth-child(5) { animation-delay: 0.4s; }
+@keyframes wave { 0%, 100% { height: 8px; } 50% { height: 32px; } }
+.status { text-align: center; margin-top: 12px; font-size: 0.8em; color: #555; }
+</style>
+</head>
+<body>
+<div class="container">
+    <h1>ChatterBox NG</h1>
+    <p class="subtitle">Real-time voice synthesis</p>
+
+    <label>Testo</label>
+    <textarea id="text" placeholder="Scrivi qui...">Buonanotte, LottoCasa. Sono Sara. In cosa posso esserle utile?</textarea>
+
+    <div class="row">
+        <div>
+            <label>Voce</label>
+            <select id="voice">
+                <option value="sara">Sara</option>
+                <option value="marco">Marco</option>
+                <option value="lella">Lella</option>
+            </select>
+        </div>
+        <div>
+            <label>Lingua</label>
+            <select id="language">
+                <option value="it">Italiano</option>
+                <option value="en">English</option>
+                <option value="es">Español</option>
+                <option value="fr">Français</option>
+                <option value="de">Deutsch</option>
+            </select>
+        </div>
+    </div>
+
+    <label>Server</label>
+    <input type="text" id="server" value="ws://localhost:8765">
+
+    <button id="btn" onclick="speak()">Genera</button>
+
+    <div class="wave" id="wave">
+        <span></span><span></span><span></span><span></span><span></span>
+    </div>
+
+    <div class="status" id="status"></div>
+
+    <div class="metrics" id="metrics"></div>
+</div>
+
+<script>
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+let isStreaming = false;
+let scheduledTime = 0;
+
+function status(msg) { document.getElementById('status').textContent = msg; }
+
+async function speak() {
+    if (isStreaming) return;
+    isStreaming = true;
+
+    const btn = document.getElementById('btn');
+    const wave = document.getElementById('wave');
+    const metricsDiv = document.getElementById('metrics');
+    btn.disabled = true;
+    btn.classList.add('streaming');
+    btn.textContent = 'Generando...';
+    wave.classList.add('active');
+    metricsDiv.style.display = 'none';
+    status('Connessione...');
+
+    const server = document.getElementById('server').value;
+    const ws = new WebSocket(server);
+    ws.binaryType = 'arraybuffer';
+
+    scheduledTime = audioCtx.currentTime + 0.05; // small buffer
+    let chunkCount = 0;
+    let firstChunkAt = null;
+    const startTime = performance.now();
+
+    ws.onopen = () => {
+        status('Connesso — generazione in corso...');
+        ws.send(JSON.stringify({
+            text: document.getElementById('text').value,
+            voice: document.getElementById('voice').value,
+            language: document.getElementById('language').value,
+        }));
+    };
+
+    ws.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+            // PCM int16 chunk → play immediately
+            const int16 = new Int16Array(event.data);
+            const float32 = new Float32Array(int16.length);
+            for (let i = 0; i < int16.length; i++) {
+                float32[i] = int16[i] / 32768;
+            }
+
+            const buffer = audioCtx.createBuffer(1, float32.length, 24000);
+            buffer.getChannelData(0).set(float32);
+            const source = audioCtx.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioCtx.destination);
+
+            // Schedule seamlessly after previous chunk
+            const now = audioCtx.currentTime;
+            if (scheduledTime < now) scheduledTime = now + 0.01;
+            source.start(scheduledTime);
+            scheduledTime += buffer.duration;
+
+            chunkCount++;
+            if (!firstChunkAt) {
+                firstChunkAt = performance.now() - startTime;
+                status(`Primo audio in ${Math.round(firstChunkAt)}ms`);
+            }
+        } else {
+            // JSON completion message
+            try {
+                const m = JSON.parse(event.data);
+                if (m.error) {
+                    status(`Errore: ${m.error}`);
+                } else if (m.done) {
+                    metricsDiv.innerHTML = [
+                        `Durata audio    <span class="value">${m.duration}s</span>`,
+                        `Tempo totale    <span class="value">${m.wall_time}s</span>`,
+                        `Primo chunk     <span class="value">${m.first_chunk_ms}ms</span>`,
+                        `Chunks          <span class="value">${m.chunks}</span>`,
+                        `RTF             <span class="value">${m.rtf}x</span>`,
+                        `Voce            <span class="value">${m.voice}</span>`,
+                    ].join('\n');
+                    metricsDiv.style.display = 'block';
+                    status('Completato');
+                }
+            } catch(e) {}
+            ws.close();
+        }
+    };
+
+    ws.onerror = () => status('Errore di connessione');
+    ws.onclose = () => {
+        isStreaming = false;
+        btn.disabled = false;
+        btn.classList.remove('streaming');
+        btn.textContent = 'Genera';
+        wave.classList.remove('active');
+    };
+}
+</script>
+</body>
+</html>
