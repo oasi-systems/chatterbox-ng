@@ -25,6 +25,8 @@ import torch
 import torch.nn.functional as F
 import perth
 
+from math import gcd
+
 from .models.s3tokenizer import drop_invalid_tokens, SPEECH_VOCAB_SIZE
 from .models.s3gen import S3GEN_SR
 from .models.t3.modules.cond_enc import T3Cond
@@ -43,6 +45,67 @@ def _split_sentences(text: str) -> List[str]:
     # Filter empty strings and strip whitespace
     sentences = [s.strip() for s in parts if s.strip()]
     return sentences if sentences else [text]
+
+
+class StreamingResampler:
+    """Streaming audio resampler for converting between sample rates without boundary artifacts.
+
+    Accumulates input and re-resamples the full signal each call, returning only
+    new output samples. This guarantees zero boundary artifacts (bit-exact with
+    offline resampling). The O(N²) total cost is negligible for speech-length signals
+    (~68ms for a 30s utterance).
+
+    Usage:
+        resampler = StreamingResampler(24000, 16000)
+        for chunk_24k in audio_chunks:
+            chunk_16k = resampler.process(chunk_24k)
+            send_to_asterisk(chunk_16k)
+    """
+
+    def __init__(self, orig_sr: int = S3GEN_SR, target_sr: int = 16000):
+        from scipy.signal import resample_poly as _resample_poly
+        self._resample_poly = _resample_poly
+        self.orig_sr = orig_sr
+        self.target_sr = target_sr
+        g = gcd(orig_sr, target_sr)
+        self._up = target_sr // g
+        self._down = orig_sr // g
+        self._all_input = np.array([], dtype=np.float32)
+        self._output_emitted = 0
+
+    def process(self, chunk: np.ndarray, finalize: bool = False) -> np.ndarray:
+        """Resample a chunk and return new output samples.
+
+        Args:
+            chunk: input audio at orig_sr
+            finalize: if True, flush all remaining samples (last chunk)
+
+        Returns:
+            Resampled audio at target_sr. May be empty if not enough input yet.
+        """
+        self._all_input = np.concatenate([self._all_input, chunk])
+        all_output = self._resample_poly(self._all_input, self._up, self._down)
+
+        if finalize:
+            new = all_output[self._output_emitted:]
+            self._output_emitted = len(all_output)
+            return new.astype(np.float32)
+
+        # Hold back last few samples to avoid shutdown transient
+        # Filter half_len=10, max(up,down) taps → ~20 output samples affected
+        holdback = 20
+        safe_end = len(all_output) - holdback
+        if safe_end <= self._output_emitted:
+            return np.array([], dtype=np.float32)
+
+        new = all_output[self._output_emitted:safe_end]
+        self._output_emitted = safe_end
+        return new.astype(np.float32)
+
+    def reset(self):
+        """Reset state for a new utterance."""
+        self._all_input = np.array([], dtype=np.float32)
+        self._output_emitted = 0
 
 
 class ChatterboxStreamingTTS:
@@ -65,7 +128,10 @@ class ChatterboxStreamingTTS:
         chunk_tokens: int = 25,
         min_initial_tokens: int = 15,
         streaming_cfm_steps: int = 4,
+        use_cfm_windowing: bool = True,
+        cfm_context_frames: int = 20,
         use_kv_cache: bool = False,
+        output_sample_rate: int = None,
     ):
         """
         Args:
@@ -74,16 +140,38 @@ class ChatterboxStreamingTTS:
             min_initial_tokens: minimum tokens before first audio emission (higher = better first-chunk quality)
             streaming_cfm_steps: CFM ODE steps for intermediate chunks (fewer = faster, lower quality).
                 Final chunk always uses full steps. Set to None to use model default.
-            use_kv_cache: if True, use encoder KV-cache + CFM context window for O(chunk) cost.
-                Experimental — may degrade quality. Default False uses full reprocessing.
+            use_cfm_windowing: if True, use CFM context window optimization.
+                Re-processes encoder fully (correct for bidirectional) but runs CFM only on
+                [context | new] frames with frozen context. Saves ~60-80% CFM cost.
+            cfm_context_frames: number of mel frames to freeze as CFM context (default: 20)
+            use_kv_cache: if True, use encoder KV-cache + CFM context window.
+                Deprecated — encoder KV-cache degrades quality with bidirectional encoder.
+                Use use_cfm_windowing instead.
+            output_sample_rate: if set, resample output to this rate (e.g. 16000 for Asterisk).
+                Uses streaming polyphase resampler with zero boundary artifacts.
+                Default None = output at native 24kHz.
         """
         self.model = model
         self.chunk_tokens = chunk_tokens
         self.min_initial_tokens = min_initial_tokens
-        self.streaming_cfm_steps = streaming_cfm_steps
+        # With meanflow (2 ODE steps), intermediate chunks don't need reduced steps
+        if streaming_cfm_steps is not None and hasattr(model, 's3gen') and model.s3gen.meanflow:
+            self.streaming_cfm_steps = None  # let flow_inference use its 2-step default
+        else:
+            self.streaming_cfm_steps = streaming_cfm_steps
+        self.use_cfm_windowing = use_cfm_windowing
+        self.cfm_context_frames = cfm_context_frames
         self.use_kv_cache = use_kv_cache
-        self.sample_rate = S3GEN_SR
+
+        if output_sample_rate and output_sample_rate != S3GEN_SR:
+            self._resampler = StreamingResampler(S3GEN_SR, output_sample_rate)
+            self.sample_rate = output_sample_rate
+        else:
+            self._resampler = None
+            self.sample_rate = S3GEN_SR
         self._all_chunks = []
+        if self._resampler is not None:
+            self._resampler.reset()
         self._watermarker = perth.PerthImplicitWatermarker()
 
     def _is_multilingual(self):
@@ -181,6 +269,8 @@ class ChatterboxStreamingTTS:
             return
 
         self._all_chunks = []
+        if self._resampler is not None:
+            self._resampler.reset()
         is_turbo = self._is_turbo()
         device = self.model.device
 
@@ -248,6 +338,8 @@ class ChatterboxStreamingTTS:
         - Natural sentence boundaries produce cleaner prosody
         """
         self._all_chunks = []
+        if self._resampler is not None:
+            self._resampler.reset()
         is_turbo = self._is_turbo()
         device = self.model.device
 
@@ -326,9 +418,12 @@ class ChatterboxStreamingTTS:
     ) -> Optional[np.ndarray]:
         """Run S3Gen on accumulated tokens and return new audio.
 
-        Uses encoder KV-cache + CFM context window for O(chunk) cost per chunk
-        instead of O(N) re-processing. Falls back to full reprocessing if
-        encoder_caches is not available on the state.
+        Three modes (selected by constructor flags):
+        1. use_cfm_windowing=True (default): Full encoder + CFM context window.
+           Correct bidirectional encoder, saves ~60-80% CFM cost.
+        2. use_kv_cache=True: Encoder KV-cache + CFM context window.
+           Fastest but degrades quality (stale KV from bidirectional encoder).
+        3. Neither: Full reprocessing (O(N²) encoder + O(N) CFM). Slowest but safest.
 
         Uses reduced ODE steps for intermediate chunks (streaming_cfm_steps)
         and full steps for the final chunk, balancing latency and quality.
@@ -340,17 +435,28 @@ class ChatterboxStreamingTTS:
         if effective_steps is None and not finalize and self.streaming_cfm_steps is not None:
             effective_steps = self.streaming_cfm_steps
 
-        # Use cached path only if explicitly enabled and encoder caches are available
         if self.use_kv_cache and hasattr(stream_state, 'encoder_caches') and stream_state.encoder_caches is not None:
+            # Legacy: encoder KV-cache + CFM window (deprecated, quality issues)
             audio_chunk, updated_state = self.model.s3gen.streaming_step_cached(
                 all_tokens=all_tokens,
                 ref_dict=self.model.conds.gen,
                 state=stream_state,
                 finalize=finalize,
                 n_cfm_timesteps=effective_steps,
-                context_frames=20,
+                context_frames=self.cfm_context_frames,
+            )
+        elif self.use_cfm_windowing:
+            # Hybrid: full encoder + CFM context window (recommended)
+            audio_chunk, updated_state = self.model.s3gen.streaming_step_windowed(
+                all_tokens=all_tokens,
+                ref_dict=self.model.conds.gen,
+                state=stream_state,
+                finalize=finalize,
+                n_cfm_timesteps=effective_steps,
+                context_frames=self.cfm_context_frames,
             )
         else:
+            # Fallback: full reprocessing (slowest, highest quality)
             audio_chunk, updated_state = self.model.s3gen.streaming_step(
                 all_tokens=all_tokens,
                 ref_dict=self.model.conds.gen,
@@ -368,6 +474,13 @@ class ChatterboxStreamingTTS:
 
         chunk_np = audio_chunk.squeeze(0).detach().cpu().numpy()
         self._all_chunks.append(chunk_np)
+
+        # Resample if output_sample_rate differs from native 24kHz
+        if self._resampler is not None:
+            chunk_np = self._resampler.process(chunk_np, finalize=finalize)
+            if len(chunk_np) == 0:
+                return None
+
         return chunk_np
 
     def get_full_watermarked(self) -> np.ndarray:

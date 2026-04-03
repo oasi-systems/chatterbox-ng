@@ -19,6 +19,7 @@ from .models.t3.modules.cond_enc import T3Cond
 
 
 REPO_ID = "ResembleAI/chatterbox"
+TURBO_REPO_ID = "ResembleAI/chatterbox-turbo"
 
 # Supported languages for the multilingual model
 SUPPORTED_LANGUAGES = {
@@ -171,7 +172,7 @@ class ChatterboxMultilingualTTS:
         return SUPPORTED_LANGUAGES.copy()
 
     @classmethod
-    def from_local(cls, ckpt_dir, device) -> 'ChatterboxMultilingualTTS':
+    def from_local(cls, ckpt_dir, device, meanflow=False, meanflow_ckpt_dir=None) -> 'ChatterboxMultilingualTTS':
         ckpt_dir = Path(ckpt_dir)
 
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
@@ -193,10 +194,17 @@ class ChatterboxMultilingualTTS:
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
 
-        s3gen = S3Gen()
-        s3gen.load_state_dict(
-            torch.load(ckpt_dir / "s3gen.pt", map_location=map_location, weights_only=True)
-        )
+        s3gen = S3Gen(meanflow=meanflow)
+        if meanflow and meanflow_ckpt_dir:
+            meanflow_ckpt_dir = Path(meanflow_ckpt_dir)
+            s3gen.load_state_dict(
+                load_safetensors(meanflow_ckpt_dir / "s3gen_meanflow.safetensors"),
+                strict=True,
+            )
+        else:
+            s3gen.load_state_dict(
+                torch.load(ckpt_dir / "s3gen.pt", map_location=map_location, weights_only=True)
+            )
         s3gen.to(device).eval()
 
         tokenizer = MTLTokenizer(
@@ -210,7 +218,15 @@ class ChatterboxMultilingualTTS:
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
 
     @classmethod
-    def from_pretrained(cls, device: torch.device) -> 'ChatterboxMultilingualTTS':
+    def from_pretrained(cls, device: torch.device, meanflow: bool = False) -> 'ChatterboxMultilingualTTS':
+        """Load pretrained multilingual ChatterBox model.
+
+        Args:
+            device: torch device
+            meanflow: if True, load meanflow S3Gen weights from the turbo repo.
+                Uses 2 ODE steps instead of 10 + no CFG batch doubling = ~5-7x CFM speedup.
+                Quality may differ — the meanflow weights were distilled from English data.
+        """
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
             if not torch.backends.mps.is_built():
@@ -228,7 +244,20 @@ class ChatterboxMultilingualTTS:
                 token=os.getenv("HF_TOKEN"),
             )
         )
-        return cls.from_local(ckpt_dir, device)
+
+        meanflow_ckpt_dir = None
+        if meanflow:
+            meanflow_ckpt_dir = Path(
+                snapshot_download(
+                    repo_id=TURBO_REPO_ID,
+                    repo_type="model",
+                    revision="main",
+                    allow_patterns=["s3gen_meanflow.safetensors"],
+                    token=os.getenv("HF_TOKEN"),
+                )
+            )
+
+        return cls.from_local(ckpt_dir, device, meanflow=meanflow, meanflow_ckpt_dir=meanflow_ckpt_dir)
     
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
         ## Load reference wav

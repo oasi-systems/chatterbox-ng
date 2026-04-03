@@ -79,23 +79,41 @@ class VoiceRegistry:
 class TTSEngine:
     """Wraps model + streaming for concurrent request handling."""
 
-    def __init__(self, device: str = "cuda", voices_dir: str = "voices/"):
+    def __init__(self, device: str = "cuda", voices_dir: str = "voices/",
+                 meanflow: bool = False, output_sr: int = 24000,
+                 trt_engine_dir: str = None):
         from chatterbox.mtl_tts import ChatterboxMultilingualTTS
         from chatterbox.streaming import ChatterboxStreamingTTS
 
-        logger.info(f"Loading model on {device}...")
-        self.model = ChatterboxMultilingualTTS.from_pretrained(device)
+        logger.info(f"Loading model on {device} (meanflow={meanflow}, output_sr={output_sr})...")
+        self.model = ChatterboxMultilingualTTS.from_pretrained(device, meanflow=meanflow)
+        self.output_sr = output_sr
         self.device = device
 
-        # CUDA optimizations
+        # CUDA optimizations (with optional TensorRT)
         if "cuda" in str(device):
-            from chatterbox.cuda_optimizations import optimize_for_cuda
-            optimize_for_cuda(self.model)
+            from chatterbox.cuda_optimizations import optimize_for_cuda, warmup_model
+            optimize_for_cuda(
+                self.model,
+                use_tensorrt=trt_engine_dir is not None,
+                trt_engine_dir=trt_engine_dir,
+            )
             logger.info("CUDA optimizations applied")
+            self._warmup_fn = lambda: warmup_model(self.model, device=device)
+        else:
+            self._warmup_fn = None
 
         self.StreamingTTS = ChatterboxStreamingTTS
         self.voice_registry = VoiceRegistry(self.model, voices_dir)
-        self.sample_rate = 24000
+        self.sample_rate = output_sr
+
+        # Warmup compiled kernels after voices are loaded
+        if self._warmup_fn and self.voice_registry.voices:
+            # Activate first voice for warmup
+            first_voice = next(iter(self.voice_registry.voices))
+            self.voice_registry.activate(first_voice)
+            self._warmup_fn()
+            self._warmup_fn = None
 
         # Serialization lock — model is not thread-safe
         self._lock = asyncio.Lock()
@@ -133,6 +151,8 @@ class TTSEngine:
                 chunk_tokens=25,
                 min_initial_tokens=15,
                 streaming_cfm_steps=None,
+                use_cfm_windowing=True,
+                output_sample_rate=self.sample_rate if self.sample_rate != 24000 else None,
             )
 
             t_start = time.time()
@@ -251,9 +271,17 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "mps")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--meanflow", action="store_true",
+                        help="Use meanflow S3Gen (2 ODE steps, ~5x faster CFM)")
+    parser.add_argument("--output-sr", type=int, default=24000,
+                        help="Output sample rate (default: 24000, use 16000 for Asterisk)")
+    parser.add_argument("--tensorrt", default=None, metavar="DIR",
+                        help="Directory with TRT/ONNX engines (from python -m chatterbox.trt_export)")
     args = parser.parse_args()
 
-    engine = TTSEngine(device=args.device, voices_dir=args.voices)
+    engine = TTSEngine(device=args.device, voices_dir=args.voices,
+                       meanflow=args.meanflow, output_sr=args.output_sr,
+                       trt_engine_dir=args.tensorrt)
 
     async def run():
         try:

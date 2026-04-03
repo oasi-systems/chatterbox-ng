@@ -76,7 +76,9 @@ button.streaming { background: #e74c3c; color: #fff; }
 </div>
 
 <script>
-const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+// Match server's output sample rate (default 24kHz, use 16000 if --output-sr 16000)
+const SAMPLE_RATE = 24000;
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
 let isStreaming = false;
 let scheduledTime = 0;
 
@@ -123,7 +125,7 @@ async function speak() {
                 float32[i] = int16[i] / 32768;
             }
 
-            const buffer = audioCtx.createBuffer(1, float32.length, 24000);
+            const buffer = audioCtx.createBuffer(1, float32.length, SAMPLE_RATE);
             buffer.getChannelData(0).set(float32);
             const source = audioCtx.createBufferSource();
             source.buffer = buffer;

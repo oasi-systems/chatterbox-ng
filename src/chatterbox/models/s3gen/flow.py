@@ -200,6 +200,63 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         return feat, None  # NOTE jrm: why are they returning None here?
 
     @torch.inference_mode()
+    def encode_only(
+        self,
+        token,
+        token_len,
+        prompt_token,
+        prompt_token_len,
+        prompt_feat,
+        embedding,
+        finalize,
+    ):
+        """Run encoder only (no CFM). Returns projected encoder output for speech positions.
+
+        Args:
+            token: (B, n_speech_toks) — speech tokens (without prompt)
+            token_len: (B,)
+            prompt_token, prompt_token_len: reference audio tokens
+            prompt_feat: (B, mel_len1, 80) — reference mel features
+            embedding: (1 or B, spk_dim) — speaker embedding (raw, will be projected)
+            finalize: whether generation is complete
+
+        Returns:
+            speech_mu: (B, 80, speech_mel_len) — projected encoder output for speech positions only
+            spk_embedding: (B, 80) — projected speaker embedding
+        """
+        B = token.size(0)
+
+        # xvec projection
+        embedding = torch.atleast_2d(embedding)
+        embedding = F.normalize(embedding, dim=1)
+        embedding = self.spk_embed_affine_layer(embedding)
+
+        # adjust shapes
+        prompt_token = _repeat_batch_dim(prompt_token, B, ndim=2)
+        prompt_token_len = _repeat_batch_dim(prompt_token_len, B, ndim=1)
+        embedding = _repeat_batch_dim(embedding, B, ndim=2)
+
+        # concat [prompt | speech]
+        token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
+        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+
+        if (token >= self.vocab_size).any():
+            logger.error(f"{token.max()}>{self.vocab_size}\n out-of-range special tokens found in flow, fix inputs!")
+        token = self.input_embedding(token.long()) * mask
+
+        # text encode
+        h, h_masks = self.encoder(token, token_len)
+        if finalize is False:
+            trim = self.pre_lookahead_len * self.token_mel_ratio
+            h = h[:, :-trim]
+        mel_len1 = prompt_feat.shape[1]
+        h = self.encoder_proj(h)
+
+        # Strip prompt mel positions — return only speech mel mu
+        speech_mu = h[:, mel_len1:].transpose(1, 2).contiguous()  # (B, 80, speech_mel)
+        return speech_mu, embedding
+
+    @torch.inference_mode()
     def inference_cached(
         self,
         token: torch.Tensor,

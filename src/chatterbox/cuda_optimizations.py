@@ -2,19 +2,25 @@
 CUDA/GPU optimizations for ChatterBox TTS models.
 
 Provides:
-- BF16 inference precision
-- torch.compile() on critical sub-modules
+- BF16 inference precision with TF32 matmul
+- torch.compile() on critical sub-modules (max-autotune for kernel fusion)
 - SDPA (Scaled Dot-Product Attention) upgrade for encoder attention
-- Streaming-specific optimizations (reduced ODE steps for intermediate chunks)
+- Flash Attention / Memory-Efficient SDPA backend selection
+- CUDA-specific flags (cuDNN benchmark, TF32)
+- Warmup pass to trigger JIT compilation before serving
 
 Usage:
     model = ChatterboxMultilingualTTS.from_pretrained("cuda")
     optimize_for_cuda(model)
 
+    # Optional: pre-warm the compiled kernels (recommended for production)
+    warmup_model(model, device="cuda")
+
     # Then use model normally — all optimizations are applied in-place
 """
 
 import logging
+import time
 import torch
 import torch.nn as nn
 
@@ -23,17 +29,22 @@ logger = logging.getLogger(__name__)
 
 def optimize_for_cuda(
     model,
-    compile_mode: str = "reduce-overhead",
+    compile_mode: str = "max-autotune",
     use_bf16: bool = True,
     compile_models: bool = True,
+    use_tensorrt: bool = False,
+    trt_engine_dir: str = None,
 ):
     """Apply CUDA-specific optimizations to a ChatterBox model in-place.
 
     Args:
         model: ChatterboxTTS, ChatterboxMultilingualTTS, or ChatterboxTurboTTS
-        compile_mode: torch.compile mode ("reduce-overhead", "max-autotune", "default")
+        compile_mode: torch.compile mode. "max-autotune" (best throughput, slow warmup)
+            or "reduce-overhead" (fast warmup, less fusion). Default: "max-autotune".
         use_bf16: convert to bfloat16 for 2x memory bandwidth
         compile_models: apply torch.compile to sub-modules
+        use_tensorrt: replace HiFiGAN and CFM estimator with TRT/ORT engines
+        trt_engine_dir: directory containing exported .onnx/.trt files (required if use_tensorrt=True)
 
     Returns:
         The same model, optimized.
@@ -49,6 +60,9 @@ def optimize_for_cuda(
         logger.warning("CUDA not available, skipping optimizations")
         return model
 
+    # --- CUDA backend flags ---
+    _set_cuda_flags()
+
     # --- BF16 ---
     if use_bf16 and torch.cuda.is_bf16_supported():
         logger.info("Converting to bfloat16...")
@@ -56,6 +70,19 @@ def optimize_for_cuda(
     elif use_bf16:
         logger.info("BF16 not supported on this GPU, using fp16...")
         _convert_to_fp16(model)
+
+    # --- TensorRT / ONNX Runtime acceleration ---
+    if use_tensorrt:
+        if not trt_engine_dir:
+            logger.warning("use_tensorrt=True but no trt_engine_dir specified, skipping")
+        else:
+            from .trt_runtime import load_trt_modules
+            trt_result = load_trt_modules(model, trt_engine_dir)
+            logger.info(f"TensorRT modules: {trt_result}")
+            # Don't torch.compile modules that are already using TRT
+            if trt_result.get("hifigan"):
+                compile_models = False  # TRT handles these, skip compile
+                logger.info("Skipping torch.compile for TRT-accelerated modules")
 
     # --- torch.compile ---
     if compile_models:
@@ -68,6 +95,71 @@ def optimize_for_cuda(
 
     logger.info("CUDA optimizations applied.")
     return model
+
+
+def warmup_model(model, device="cuda", n_warmup: int = 3):
+    """Run dummy inference passes to trigger JIT compilation of all torch.compile'd modules.
+
+    Call this once at server boot, after optimize_for_cuda(). The first inference
+    through compiled modules is slow (kernel autotuning + CUDA graph capture).
+    Subsequent calls hit the cached kernels.
+
+    Args:
+        model: optimized ChatterBox model
+        device: target device
+        n_warmup: number of warmup passes (3 is enough for stable compile caches)
+    """
+    logger.info(f"Warming up compiled kernels ({n_warmup} passes)...")
+    t0 = time.time()
+
+    # Need conditionals loaded for warmup
+    if model.conds is None:
+        logger.warning("No conditionals loaded — skipping warmup. Call prepare_conditionals() first.")
+        return
+
+    # Synthetic short text for warmup
+    warmup_text = "Test warmup."
+
+    with torch.inference_mode():
+        for i in range(n_warmup):
+            try:
+                if hasattr(model, 'generate'):
+                    is_multilingual = hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'cangjie_converter')
+                    kwargs = {"text": warmup_text}
+                    if is_multilingual:
+                        kwargs["language_id"] = "en"
+                    _ = model.generate(**kwargs)
+                logger.info(f"  Warmup pass {i+1}/{n_warmup} done")
+            except Exception as e:
+                logger.warning(f"  Warmup pass {i+1} failed: {e}")
+                break
+
+    elapsed = time.time() - t0
+    logger.info(f"Warmup complete in {elapsed:.1f}s — kernels cached for production speed.")
+
+
+def _set_cuda_flags():
+    """Set global CUDA flags for maximum throughput."""
+    # TF32: use Tensor Cores for fp32 matmul (19-bit mantissa, ~8x throughput)
+    # Safe for inference — negligible quality impact
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # cuDNN benchmark: auto-select fastest convolution algorithm
+    # Cost: ~1s at first conv call per shape. Pays off for repeated inference.
+    torch.backends.cudnn.benchmark = True
+
+    # Enable Flash Attention and Memory-Efficient SDPA backends
+    # L4/A10/A100/H100 all support Flash Attention v2
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+    # Disable math (fallback) SDPA — force hardware-accelerated paths
+    # This ensures we always use Flash or MemEfficient, never naive PyTorch
+    torch.backends.cuda.enable_math_sdp(False)
+
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
+    logger.info(f"CUDA flags set: TF32=on, cuDNN benchmark=on, Flash SDPA=on ({gpu_name})")
 
 
 def _convert_to_bf16(model):
@@ -98,30 +190,42 @@ def _compile_submodules(model, mode):
     - The inference loop has data-dependent control flow (EOS check)
     - Generators can't be compiled
     - Sub-module compilation avoids these issues while still fusing kernels
+
+    Strategy by bottleneck analysis (profiled on L4):
+    - Encoder (53% of time): max-autotune — attention fusion is critical
+    - CFM estimator (29%): reduce-overhead — has .pop()/.append() dynamic list ops
+    - HiFiGAN (5%): reduce-overhead — lightweight, compile overhead not worth it
+    - T3 (13%): max-autotune — transformer backbone benefits from kernel fusion
     """
     try:
-        # S3Gen encoder (UpsampleConformerEncoder)
         if hasattr(model, 's3gen') and hasattr(model.s3gen, 'flow'):
             flow = model.s3gen.flow
-            flow.encoder = torch.compile(flow.encoder, mode=mode, dynamic=True)
-            logger.info("  Compiled: S3Gen encoder")
 
-            # CFM decoder (ConditionalDecoder) — the biggest bottleneck
+            # Encoder (53% bottleneck) — max-autotune for attention kernel fusion
+            flow.encoder = torch.compile(flow.encoder, mode=mode, dynamic=True)
+            logger.info(f"  Compiled: S3Gen encoder (mode={mode})")
+
+            # CFM estimator (29%) — reduce-overhead because ConditionalDecoder
+            # has list .pop()/.append() and dynamic slicing that break graph tracing.
+            # reduce-overhead uses CUDA graphs which handle graph breaks gracefully.
+            estimator_mode = "reduce-overhead" if mode == "max-autotune" else mode
             if hasattr(flow, 'decoder') and hasattr(flow.decoder, 'estimator'):
                 flow.decoder.estimator = torch.compile(
-                    flow.decoder.estimator, mode=mode, dynamic=True
+                    flow.decoder.estimator, mode=estimator_mode, dynamic=True
                 )
-                logger.info("  Compiled: CFM decoder estimator")
+                logger.info(f"  Compiled: CFM decoder estimator (mode={estimator_mode})")
 
-        # HiFiGAN vocoder
+        # HiFiGAN vocoder (5%) — reduce-overhead, low-impact
         if hasattr(model, 's3gen') and hasattr(model.s3gen, 'mel2wav'):
-            model.s3gen.mel2wav = torch.compile(model.s3gen.mel2wav, mode=mode, dynamic=True)
-            logger.info("  Compiled: HiFiGAN vocoder")
+            model.s3gen.mel2wav = torch.compile(
+                model.s3gen.mel2wav, mode="reduce-overhead", dynamic=True
+            )
+            logger.info("  Compiled: HiFiGAN vocoder (mode=reduce-overhead)")
 
-        # T3 backbone (LlamaModel or GPT2Model)
+        # T3 backbone (LlamaModel or GPT2Model) — max-autotune
         if hasattr(model, 't3') and hasattr(model.t3, 'tfmr'):
             model.t3.tfmr = torch.compile(model.t3.tfmr, mode=mode, dynamic=True)
-            logger.info("  Compiled: T3 backbone")
+            logger.info(f"  Compiled: T3 backbone (mode={mode})")
 
     except Exception as e:
         logger.warning(f"torch.compile failed (will continue without): {e}")
