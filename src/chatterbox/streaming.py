@@ -156,9 +156,9 @@ class ChatterboxStreamingTTS:
         top_k: int = 1000,
         # S3Gen params
         n_cfm_timesteps: Optional[int] = None,
-        # Pipelining — always enabled for quality and stability.
-        # The growing-sequence mode degrades on long texts (CFM artifacts).
-        sentence_pipelining: bool = True,
+        # Pipelining splits text into sentences with independent T3 passes.
+        # Disabled by default to preserve prosody continuity.
+        sentence_pipelining: bool = False,
     ) -> Generator[np.ndarray, None, None]:
         """Stream audio chunks as speech tokens are generated.
 
