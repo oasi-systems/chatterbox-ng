@@ -65,6 +65,7 @@ class ChatterboxStreamingTTS:
         chunk_tokens: int = 25,
         min_initial_tokens: int = 15,
         streaming_cfm_steps: int = 4,
+        use_kv_cache: bool = False,
     ):
         """
         Args:
@@ -73,11 +74,14 @@ class ChatterboxStreamingTTS:
             min_initial_tokens: minimum tokens before first audio emission (higher = better first-chunk quality)
             streaming_cfm_steps: CFM ODE steps for intermediate chunks (fewer = faster, lower quality).
                 Final chunk always uses full steps. Set to None to use model default.
+            use_kv_cache: if True, use encoder KV-cache + CFM context window for O(chunk) cost.
+                Experimental — may degrade quality. Default False uses full reprocessing.
         """
         self.model = model
         self.chunk_tokens = chunk_tokens
         self.min_initial_tokens = min_initial_tokens
         self.streaming_cfm_steps = streaming_cfm_steps
+        self.use_kv_cache = use_kv_cache
         self.sample_rate = S3GEN_SR
         self._all_chunks = []
         self._watermarker = perth.PerthImplicitWatermarker()
@@ -336,8 +340,8 @@ class ChatterboxStreamingTTS:
         if effective_steps is None and not finalize and self.streaming_cfm_steps is not None:
             effective_steps = self.streaming_cfm_steps
 
-        # Use cached path if encoder caches are available
-        if hasattr(stream_state, 'encoder_caches') and stream_state.encoder_caches is not None:
+        # Use cached path only if explicitly enabled and encoder caches are available
+        if self.use_kv_cache and hasattr(stream_state, 'encoder_caches') and stream_state.encoder_caches is not None:
             audio_chunk, updated_state = self.model.s3gen.streaming_step_cached(
                 all_tokens=all_tokens,
                 ref_dict=self.model.conds.gen,
