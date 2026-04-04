@@ -443,10 +443,19 @@ class S3Token2Wav(S3Token2Mel):
         cache = state.hifi_cache_source
         if cache.shape[2] > estimated_source_len:
             cache = cache[:, :, -estimated_source_len:]
+        # Deterministic SineGen phase for streaming continuity.
+        # SineGen samples random phase offsets per harmonic on each forward() call.
+        # In streaming, different phases per chunk cause harmonic discontinuities
+        # at chunk boundaries (metallic/harsh artifacts). By seeding the RNG to the
+        # same value before each mel2wav call, every chunk gets identical phase
+        # offsets — combined with cache_source overlap, this gives seamless audio.
+        rng_state = torch.random.get_rng_state()
+        torch.manual_seed(42)
         audio_chunk, new_source = self.mel2wav.inference(
             speech_feat=new_mels,
             cache_source=cache,
         )
+        torch.random.set_rng_state(rng_state)
 
         # Apply trim fade only on first chunk to reduce reference spillover
         if state.is_first_chunk:

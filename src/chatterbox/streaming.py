@@ -215,6 +215,8 @@ class ChatterboxStreamingTTS:
         self._cumulative_speech_s = 0.0
         self._last_breath_time_s = -999.0
         self._audio_emitted_s = 0.0
+        self._rms_sum_sq = 0.0  # running sum of squared samples for overall RMS
+        self._rms_n_samples = 0  # total samples counted
 
     def _is_multilingual(self):
         return hasattr(self.model, 'tokenizer') and hasattr(self.model.tokenizer, 'cangjie_converter')
@@ -315,6 +317,8 @@ class ChatterboxStreamingTTS:
         self._cumulative_speech_s = 0.0
         self._last_breath_time_s = -999.0
         self._audio_emitted_s = 0.0
+        self._rms_sum_sq = 0.0
+        self._rms_n_samples = 0
         if self._resampler is not None:
             self._resampler.reset()
         is_turbo = self._is_turbo()
@@ -386,6 +390,12 @@ class ChatterboxStreamingTTS:
         - Natural sentence boundaries produce cleaner prosody
         """
         self._all_chunks = []
+        # Reset humanizer state for new utterance
+        self._cumulative_speech_s = 0.0
+        self._last_breath_time_s = -999.0
+        self._audio_emitted_s = 0.0
+        self._rms_sum_sq = 0.0
+        self._rms_n_samples = 0
         if self._resampler is not None:
             self._resampler.reset()
         is_turbo = self._is_turbo()
@@ -582,7 +592,12 @@ class ChatterboxStreamingTTS:
             # Check if gap already has content (T3 natural breath)
             gap_audio = chunk[gap_start:gap_end]
             gap_rms = np.sqrt(np.mean(gap_audio ** 2))
-            overall_rms = np.sqrt(np.mean(chunk ** 2))
+            # Use accumulated RMS across all chunks (not just this chunk)
+            # to avoid threshold instability from quiet/loud chunk variation
+            if self._rms_n_samples > 0:
+                overall_rms = np.sqrt(self._rms_sum_sq / self._rms_n_samples)
+            else:
+                overall_rms = np.sqrt(np.mean(chunk ** 2))
             if gap_rms > overall_rms * cfg.existing_sound_threshold:
                 continue
 
@@ -637,6 +652,10 @@ class ChatterboxStreamingTTS:
             self._last_breath_time_s = gap_time
             logger.debug(f"Streaming breath @{gap_time:.2f}s: {breath_ms}ms, "
                          f"after {self._cumulative_speech_s:.1f}s speech")
+
+        # Accumulate RMS across chunks for stable threshold
+        self._rms_sum_sq += float(np.sum(chunk ** 2))
+        self._rms_n_samples += len(chunk)
 
         self._audio_emitted_s += chunk_dur
         return result
