@@ -146,30 +146,25 @@ streamer = ChatterboxStreamingTTS(model, adaptive_chunking=False, min_initial_to
 
 ##### Voice Humanizer (breathing)
 
-The humanizer adds natural breathing sounds between sentences, making synthesized speech sound alive. It uses real breath templates adapted to the speaker's spectral profile — works with any voice.
+The humanizer adds natural breathing sounds between sentences in real-time during streaming, making synthesized speech sound alive. It uses real breath templates adapted to the speaker's spectral profile — works with any voice, zero impact on latency.
 
 ```python
 from chatterbox.humanizer import VoiceHumanizer
 
-# Create humanizer from the same reference audio used for cloning
+# Create humanizer once (reuse across calls)
 humanizer = VoiceHumanizer.from_reference("agent_voice.wav")
 
-# After streaming, humanize the full audio
-streamer = ChatterboxStreamingTTS(model)
+# Pass it to the streamer — breaths are inserted in real-time
+streamer = ChatterboxStreamingTTS(model, humanizer=humanizer)
+
 for chunk in streamer.generate_stream(text="...", language_id="it"):
+    # Each chunk already has breaths where needed
     send_to_asterisk(chunk)
-
-# Post-process: add breaths to the full audio
-import numpy as np
-from scipy.signal import resample_poly
-
-full_24k = np.concatenate(streamer._all_chunks)
-humanized_24k = humanizer.process(full_24k)
-humanized_16k = resample_poly(humanized_24k, 2, 3).astype(np.float32)
 ```
 
 The humanizer:
-- Inserts breaths **only** in existing silence gaps (never cuts speech)
+- Inserts breaths **in real-time** during streaming (zero added latency)
+- Places breaths **only** in existing silence gaps (never cuts speech)
 - Skips gaps where the model already generated natural sounds
 - Adapts breath timbre to match the target speaker
 - Scales breath duration proportionally to preceding speech length

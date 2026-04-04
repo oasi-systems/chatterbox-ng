@@ -131,6 +131,10 @@ class ChatterboxStreamingTTS:
         # Adaptive chunking: start with small chunks for low FCL, grow for quality
         adaptive_chunking: bool = True,
         adaptive_schedule: tuple = None,  # e.g. (8, 15, 25) — token thresholds per chunk
+        # Voice humanization: insert breaths between sentences in real-time
+        humanize: bool = False,
+        humanizer_reference: str = None,  # path to reference audio for breath adaptation
+        humanizer = None,  # pre-built VoiceHumanizer instance (reuse across calls)
         # Deprecated — kept for API compat, ignored
         streaming_cfm_steps: int = None,
         use_cfm_windowing: bool = False,
@@ -149,6 +153,12 @@ class ChatterboxStreamingTTS:
                 for low latency, growing chunks for better quality.
             adaptive_schedule: tuple of token counts for each chunk. After the schedule
                 is exhausted, chunk_tokens is used. Default: (5, 10, 20, chunk_tokens).
+            humanize: if True, insert natural breaths in silence gaps during streaming.
+                Requires humanizer_reference or humanizer to be set.
+            humanizer_reference: path to reference audio for breath adaptation.
+                If set, automatically enables humanize=True.
+            humanizer: pre-built VoiceHumanizer instance. Use this to avoid
+                re-extracting breath profiles on every call.
 
         Note:
             Streaming always uses full ODE steps (same as monolithic generate()).
@@ -183,6 +193,28 @@ class ChatterboxStreamingTTS:
         if self._resampler is not None:
             self._resampler.reset()
         self._watermarker = perth.PerthImplicitWatermarker()
+
+        # Humanizer setup
+        if humanizer is not None:
+            self._humanizer = humanizer
+        elif humanizer_reference or humanize:
+            from .humanizer import VoiceHumanizer
+            ref_path = humanizer_reference
+            if ref_path is None and hasattr(model, '_last_audio_prompt_path'):
+                ref_path = model._last_audio_prompt_path
+            if ref_path:
+                self._humanizer = VoiceHumanizer.from_reference(ref_path)
+            else:
+                self._humanizer = None
+                logger.warning("humanize=True but no reference audio provided. "
+                               "Pass humanizer_reference or call prepare_conditionals() first.")
+        else:
+            self._humanizer = None
+
+        # Humanizer streaming state
+        self._cumulative_speech_s = 0.0
+        self._last_breath_time_s = -999.0
+        self._audio_emitted_s = 0.0
 
     def _is_multilingual(self):
         return hasattr(self.model, 'tokenizer') and hasattr(self.model.tokenizer, 'cangjie_converter')
@@ -279,6 +311,10 @@ class ChatterboxStreamingTTS:
             return
 
         self._all_chunks = []
+        # Reset humanizer state for new utterance
+        self._cumulative_speech_s = 0.0
+        self._last_breath_time_s = -999.0
+        self._audio_emitted_s = 0.0
         if self._resampler is not None:
             self._resampler.reset()
         is_turbo = self._is_turbo()
@@ -476,6 +512,10 @@ class ChatterboxStreamingTTS:
         chunk_np = audio_chunk.squeeze(0).detach().cpu().numpy()
         self._all_chunks.append(chunk_np)
 
+        # Insert breaths in real-time if humanizer is active
+        if self._humanizer is not None:
+            chunk_np = self._humanize_chunk(chunk_np)
+
         # Resample if output_sample_rate differs from native 24kHz
         if self._resampler is not None:
             chunk_np = self._resampler.process(chunk_np, finalize=finalize)
@@ -483,6 +523,115 @@ class ChatterboxStreamingTTS:
                 return None
 
         return chunk_np
+
+    def _humanize_chunk(self, chunk: np.ndarray) -> np.ndarray:
+        """Insert breaths into silence gaps within this chunk.
+
+        Analyzes the chunk for silence gaps (≥200ms) and inserts a breath
+        if enough speech has accumulated and enough time has passed since
+        the last breath. Modifies chunk in-place.
+
+        This runs at 24kHz (before resampling) so it adds negligible latency.
+        """
+        import librosa
+
+        sr = S3GEN_SR
+        cfg = self._humanizer.config
+        chunk_dur = len(chunk) / sr
+
+        # Find speech/silence segments in this chunk
+        intervals = librosa.effects.split(chunk, top_db=cfg.silence_top_db)
+
+        if len(intervals) == 0:
+            # Entire chunk is silence
+            return chunk
+
+        result = chunk.copy()
+        chunk_time_start = self._audio_emitted_s
+
+        for i in range(len(intervals)):
+            seg_start, seg_end = intervals[i]
+            seg_dur = (seg_end - seg_start) / sr
+            self._cumulative_speech_s += seg_dur
+
+            # Check gap AFTER this segment (if not last segment)
+            if i < len(intervals) - 1:
+                gap_start = seg_end
+                gap_end = intervals[i + 1][0]
+            elif seg_end < len(chunk):
+                # Gap at end of chunk (trailing silence)
+                gap_start = seg_end
+                gap_end = len(chunk)
+            else:
+                continue
+
+            gap_dur = (gap_end - gap_start) / sr
+            gap_time = chunk_time_start + gap_start / sr
+
+            if gap_dur < cfg.min_gap_s:
+                continue
+
+            # Check if gap already has content (T3 natural breath)
+            gap_audio = chunk[gap_start:gap_end]
+            gap_rms = np.sqrt(np.mean(gap_audio ** 2))
+            overall_rms = np.sqrt(np.mean(chunk ** 2))
+            if gap_rms > overall_rms * cfg.existing_sound_threshold:
+                continue
+
+            # Enough speech before?
+            if self._cumulative_speech_s < cfg.min_speech_before_s:
+                continue
+
+            # Enough time since last breath?
+            if gap_time - self._last_breath_time_s < cfg.min_breath_spacing_s:
+                continue
+
+            # Insert breath
+            breath_ms = self._humanizer._get_breath_duration_ms(self._cumulative_speech_s)
+            breath_samples = int(breath_ms / 1000 * sr)
+            padding = int(cfg.breath_padding_ms / 1000 * sr)
+            available = gap_end - gap_start - 2 * padding
+
+            if available < breath_samples:
+                breath_samples = max(available, int(0.05 * sr))
+            if breath_samples <= 0:
+                continue
+
+            # Local speech RMS for volume
+            ctx_start = max(0, gap_start - int(0.5 * sr))
+            local_speech = chunk[ctx_start:gap_start]
+            local_rms = np.sqrt(np.mean(local_speech ** 2)) if len(local_speech) > 0 else 0.05
+            target_rms = local_rms * cfg.breath_volume_ratio
+
+            breath = self._humanizer.breaths.get_breath(
+                duration_ms=int(breath_samples / sr * 1000),
+                volume_rms=target_rms,
+            )
+
+            # Apply fade
+            fade = int(cfg.breath_fade_ms / 1000 * sr)
+            if len(breath) > 2 * fade:
+                breath[:fade] *= np.linspace(0, 1, fade)
+                breath[-fade:] *= np.linspace(1, 0, fade)
+
+            # Place centered in gap
+            gap_center = (gap_start + gap_end) // 2
+            b_start = gap_center - len(breath) // 2
+            b_start = max(gap_start + padding, b_start)
+            b_end = b_start + len(breath)
+            if b_end > gap_end - padding:
+                b_end = gap_end - padding
+                b_start = b_end - len(breath)
+                if b_start < gap_start + padding:
+                    continue
+
+            result[b_start:b_end] = breath[:b_end - b_start]
+            self._last_breath_time_s = gap_time
+            logger.debug(f"Streaming breath @{gap_time:.2f}s: {breath_ms}ms, "
+                         f"after {self._cumulative_speech_s:.1f}s speech")
+
+        self._audio_emitted_s += chunk_dur
+        return result
 
     def get_full_watermarked(self) -> np.ndarray:
         """Get the full watermarked audio after streaming is complete.
