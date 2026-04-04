@@ -171,7 +171,11 @@ def _convert_to_bf16(model):
     full precision (HiFiGAN vocoder for phase accumulation).
     """
     # 1. Blanket cast — all weights AND biases to BF16
-    model.to(dtype=torch.bfloat16)
+    # Model wrapper is not nn.Module, so cast sub-modules individually
+    if hasattr(model, 't3'):
+        model.t3.to(dtype=torch.bfloat16)
+    if hasattr(model, 's3gen'):
+        model.s3gen.to(dtype=torch.bfloat16)
 
     # 2. Restore fp32 where needed:
 
