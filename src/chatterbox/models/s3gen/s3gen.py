@@ -472,15 +472,17 @@ class S3Token2Wav(S3Token2Mel):
         n_cfm_timesteps: int = None,
         context_frames: int = 20,
     ) -> Tuple[Optional[torch.Tensor], 'S3Token2Wav.StreamState']:
-        """Hybrid streaming: full encoder re-processing + CFM context window.
+        """Hybrid streaming: full encoder + CFM on full [prompt|speech] sequence.
 
-        Strategy:
-        - Encoder: re-processes ALL tokens every chunk (correct for bidirectional encoder)
-        - CFM: runs ODE on [context | new] mel frames with frozen context (saves ~60-80% CFM cost)
+        Mirrors the standard inference() path exactly:
+        - Encoder: re-processes ALL tokens (correct for bidirectional encoder)
+        - CFM: runs on FULL [prompt_mel | speech_mel] with prompt_feat conditioning,
+          freezing prompt + previously generated speech frames
         - HiFiGAN: uses waveform cache for continuity
 
-        This avoids the quality degradation of encoder KV-cache (stale K/V from bidirectional
-        attention) while still saving significant CFM compute for longer sequences.
+        This produces identical quality to monolithic generate() because the CFM
+        decoder sees the same inputs: full encoder mu, prompt_feat as conditioning,
+        and speaker embedding.
 
         Args:
             all_tokens: ALL speech tokens so far
@@ -488,7 +490,7 @@ class S3Token2Wav(S3Token2Mel):
             state: streaming state
             finalize: True when EOS
             n_cfm_timesteps: ODE steps (default: 2 for meanflow, 10 otherwise)
-            context_frames: mel frames to use as frozen CFM context
+            context_frames: (unused, kept for API compat — freeze is now prompt + prev speech)
         """
         n_cfm_timesteps = n_cfm_timesteps or (2 if self.meanflow else 10)
         all_tokens = torch.atleast_2d(all_tokens)
@@ -502,7 +504,8 @@ class S3Token2Wav(S3Token2Mel):
         speech_token_lens = torch.LongTensor([all_tokens.size(-1)]).to(self.device)
 
         # --- Step 1: Full encoder (correct bidirectional) ---
-        speech_mu, spk_emb = self.flow.encode_only(
+        # Returns FULL [prompt | speech] mu, not just speech
+        full_mu, spk_emb, prompt_mel_len = self.flow.encode_only(
             token=all_tokens,
             token_len=speech_token_lens,
             prompt_token=prompt_token,
@@ -511,52 +514,41 @@ class S3Token2Wav(S3Token2Mel):
             embedding=embedding,
             finalize=finalize,
         )
-        # speech_mu: (B, 80, speech_mel_len)  — encoder output for speech only
+        # full_mu: (B, 80, prompt_mel + speech_mel)
 
-        total_speech_mel = speech_mu.size(2)
+        total_speech_mel = full_mu.size(2) - prompt_mel_len
         new_mel_frames = total_speech_mel - state.prev_stable_mel_len
 
         if new_mel_frames <= 0:
             return None, state
 
-        # --- Step 2: CFM with context window ---
-        new_mu = speech_mu[:, :, state.prev_stable_mel_len:]  # (B, 80, new_mel_frames)
-
-        actual_context = 0
-        if state.cached_mel is not None and context_frames > 0:
-            actual_context = min(context_frames, state.cached_mel.size(2))
-            context_mel = state.cached_mel[:, :, -actual_context:]
-            # Context mu from full encoder output (always up-to-date since we re-encode)
-            ctx_start = max(0, state.prev_stable_mel_len - actual_context)
-            context_mu = speech_mu[:, :, ctx_start:state.prev_stable_mel_len]
-            actual_context = context_mu.size(2)  # may be less if near start
-        else:
-            context_mel = None
-            context_mu = None
-
-        if context_mu is not None and actual_context > 0:
-            mu_windowed = torch.cat([context_mu, new_mu], dim=2)
-        else:
-            mu_windowed = new_mu
-            context_mel = torch.zeros(1, 80, 0, device=self.device, dtype=self.dtype)
-            actual_context = 0
-
-        # Run windowed CFM
+        # --- Step 2: CFM on full [prompt | speech] with freeze ---
+        # This matches standard inference() exactly:
+        # - mu = full encoder output [prompt | speech]
+        # - cond = [prompt_feat | zeros] (voice conditioning)
+        # - freeze_len = prompt_mel + previously generated speech mel
         new_mel = self.flow.inference_windowed(
-            mu_windowed=mu_windowed,
-            context_mel=context_mel if actual_context > 0 else torch.zeros(1, 80, 0, device=self.device, dtype=self.dtype),
+            full_mu=full_mu,
+            prompt_feat=prompt_feat,
             embedding=spk_emb,
-            context_frames=actual_context,
+            prompt_mel_len=prompt_mel_len,
+            prev_speech_mel_len=state.prev_stable_mel_len,
             n_timesteps=n_cfm_timesteps,
             meanflow=self.meanflow,
+            cached_mel=state.cached_mel,
         )
         new_mel = new_mel.to(dtype=self.dtype)
 
-        # Accumulate cached mel
-        if state.cached_mel is not None:
-            state.cached_mel = torch.cat([state.cached_mel, new_mel], dim=2)
+        # Accumulate cached mel (full sequence: prompt + all speech)
+        if state.cached_mel is None:
+            # First chunk: build [prompt_mel | new_speech_mel]
+            # Initialize prompt portion from z_init (will be frozen in subsequent calls)
+            prompt_cached = torch.zeros(1, 80, prompt_mel_len, device=self.device, dtype=self.dtype)
+            if prompt_feat.size(1) > 0:
+                prompt_cached = prompt_feat.transpose(1, 2).contiguous().to(self.dtype)
+            state.cached_mel = torch.cat([prompt_cached, new_mel], dim=2)
         else:
-            state.cached_mel = new_mel
+            state.cached_mel = torch.cat([state.cached_mel, new_mel], dim=2)
 
         # --- Step 3: HiFiGAN vocoding ---
         estimated_source_len = new_mel.shape[2] * 120

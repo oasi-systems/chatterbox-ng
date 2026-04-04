@@ -210,7 +210,11 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         embedding,
         finalize,
     ):
-        """Run encoder only (no CFM). Returns projected encoder output for speech positions.
+        """Run encoder only (no CFM). Returns projected encoder output for ALL positions
+        (prompt + speech) plus the prompt mel length so the caller can split them.
+
+        This is critical because the CFM decoder needs the full [prompt | speech] sequence
+        with prompt_feat as conditioning — without it, voice quality degrades severely.
 
         Args:
             token: (B, n_speech_toks) — speech tokens (without prompt)
@@ -221,8 +225,9 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             finalize: whether generation is complete
 
         Returns:
-            speech_mu: (B, 80, speech_mel_len) — projected encoder output for speech positions only
+            full_mu: (B, 80, prompt_mel + speech_mel) — projected encoder output for FULL sequence
             spk_embedding: (B, 80) — projected speaker embedding
+            prompt_mel_len: int — number of prompt mel frames (for splitting)
         """
         B = token.size(0)
 
@@ -252,9 +257,9 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         mel_len1 = prompt_feat.shape[1]
         h = self.encoder_proj(h)
 
-        # Strip prompt mel positions — return only speech mel mu
-        speech_mu = h[:, mel_len1:].transpose(1, 2).contiguous()  # (B, 80, speech_mel)
-        return speech_mu, embedding
+        # Return FULL sequence (prompt + speech) — caller splits as needed
+        full_mu = h.transpose(1, 2).contiguous()  # (B, 80, prompt_mel + speech_mel)
+        return full_mu, embedding, mel_len1
 
     @torch.inference_mode()
     def inference_cached(
@@ -326,56 +331,69 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
     @torch.inference_mode()
     def inference_windowed(
         self,
-        mu_windowed: torch.Tensor,
-        context_mel: torch.Tensor,
+        full_mu: torch.Tensor,
+        prompt_feat: torch.Tensor,
         embedding: torch.Tensor,
-        context_frames: int,
+        prompt_mel_len: int,
+        prev_speech_mel_len: int,
         n_timesteps: int = 10,
         meanflow: bool = False,
+        cached_mel: torch.Tensor = None,
     ) -> torch.Tensor:
-        """CFM inference with context window (cache-and-freeze).
+        """CFM inference that mirrors the standard inference() path exactly.
 
-        Runs ODE on [context_mel | noise_for_new] with context frames frozen
-        after each ODE step. Only returns mel for new frames.
+        Runs CFM on the FULL [prompt | speech] sequence with proper prompt_feat
+        conditioning, then extracts only the NEW speech frames. Previous speech
+        frames are frozen via freeze_len to avoid recomputing them.
+
+        This produces identical quality to the monolithic path because the CFM
+        decoder sees the same inputs: full mu, prompt_feat as cond, speaker embedding.
 
         Args:
-            mu_windowed: (B, 80, context_frames + new_frames) — encoder output for window
-            context_mel: (B, 80, context_frames) — cached mel to use as frozen context
+            full_mu: (B, 80, prompt_mel + total_speech_mel) — full encoder output
+            prompt_feat: (B, prompt_mel, 80) — reference mel features (row-major)
             embedding: (B, 80) — projected speaker embedding
-            context_frames: number of leading frames to freeze
+            prompt_mel_len: number of prompt mel frames
+            prev_speech_mel_len: speech mel frames already generated (to freeze)
             n_timesteps: ODE steps
             meanflow: whether to use meanflow mode
+            cached_mel: (B, 80, prompt_mel + prev_speech_mel) — accumulated mel to freeze
 
         Returns:
-            new_mel: (B, 80, new_frames) — generated mel for new positions only
+            new_mel: (B, 80, new_speech_frames) — generated mel for new positions only
         """
-        B = mu_windowed.size(0)
-        total_frames = mu_windowed.size(2)
+        B = full_mu.size(0)
+        total_frames = full_mu.size(2)  # prompt_mel + total_speech_mel
 
-        # Build initial z: [context_mel | random_noise]
-        # Pass as noised_mels covering entire sequence so CausalConditionalCFM
-        # replaces its own randn with our initialization
-        z_init = torch.randn(B, 80, total_frames, device=mu_windowed.device, dtype=mu_windowed.dtype)
-        if context_frames > 0:
-            z_init[:, :, :context_frames] = context_mel
+        # Frames to freeze: prompt + previously generated speech
+        freeze_len = prompt_mel_len + prev_speech_mel_len
 
-        # Conditioning: zeros (no prompt feat in windowed mode, style from spks)
-        conds = torch.zeros(B, 80, total_frames, device=mu_windowed.device, dtype=mu_windowed.dtype)
+        # Build initial z: [cached_mel | random_noise_for_new]
+        z_init = torch.randn(B, 80, total_frames, device=full_mu.device, dtype=full_mu.dtype)
+        if cached_mel is not None and cached_mel.size(2) > 0:
+            n_cached = min(cached_mel.size(2), freeze_len)
+            z_init[:, :, :n_cached] = cached_mel[:, :, :n_cached]
+
+        # Build conditioning: prompt_feat in prompt positions, zeros for speech
+        # This matches exactly what inference() does:
+        #   conds[:, :mel_len1] = prompt_feat
+        conds = torch.zeros(B, 80, total_frames, device=full_mu.device, dtype=full_mu.dtype)
+        conds[:, :, :prompt_mel_len] = prompt_feat.transpose(1, 2).contiguous()
 
         # Mask: all valid
-        mask = torch.ones(B, 1, total_frames, device=mu_windowed.device, dtype=mu_windowed.dtype)
+        mask = torch.ones(B, 1, total_frames, device=full_mu.device, dtype=full_mu.dtype)
 
-        # Run CFM decoder with freeze — noised_mels=z_init replaces the full z
+        # Run CFM decoder — freeze prompt + previous speech frames
         feat, _ = self.decoder(
-            mu=mu_windowed,
+            mu=full_mu,
             mask=mask,
             spks=embedding,
             cond=conds,
             n_timesteps=n_timesteps,
             noised_mels=z_init,
             meanflow=meanflow,
-            freeze_len=context_frames,
+            freeze_len=freeze_len,
         )
 
-        # Extract only new frames
-        return feat[:, :, context_frames:]
+        # Extract only NEW speech frames (after prompt + previously generated)
+        return feat[:, :, freeze_len:]
