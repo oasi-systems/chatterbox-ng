@@ -187,9 +187,12 @@ def _convert_to_bf16(model):
     if hasattr(model, 've'):
         model.ve.to(dtype=torch.float32)
 
-    # S3Gen's cond_encoder also uses fbank internally — keep fp32
-    if hasattr(model, 's3gen') and hasattr(model.s3gen, 'cond_encoder'):
-        model.s3gen.cond_encoder.to(dtype=torch.float32)
+    # Speaker encoder (xvector/CAMPPlus) stays fp32 — extract_feature()
+    # calls Kaldi.fbank which uses FFT, not supported in BF16.
+    # Note: speaker_encoder.inference() also casts input to fp32 internally,
+    # but embed_ref() must pass fp32 input to avoid FFT crash in extract_feature().
+    if hasattr(model, 's3gen') and hasattr(model.s3gen, 'speaker_encoder'):
+        model.s3gen.speaker_encoder.to(dtype=torch.float32)
 
 
 def _convert_to_fp16(model):

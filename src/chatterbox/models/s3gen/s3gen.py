@@ -140,7 +140,8 @@ class S3Token2Mel(torch.nn.Module):
         ref_wav_24 = ref_wav
         if ref_sr != S3GEN_SR:
             ref_wav_24 = get_resampler(ref_sr, S3GEN_SR, device)(ref_wav)
-        ref_wav_24 = ref_wav_24.to(device=device, dtype=self.dtype)
+        # mel_extractor uses torch.stft (FFT) — must stay fp32
+        ref_wav_24 = ref_wav_24.to(device=device, dtype=torch.float32)
 
         ref_mels_24 = self.mel_extractor(ref_wav_24).transpose(1, 2).to(dtype=self.dtype)
         ref_mels_24_len = None
@@ -150,8 +151,8 @@ class S3Token2Mel(torch.nn.Module):
         if ref_sr != S3_SR:
             ref_wav_16 = get_resampler(ref_sr, S3_SR, device)(ref_wav)
 
-        # Speaker embedding
-        ref_x_vector = self.speaker_encoder.inference(ref_wav_16.to(dtype=self.dtype))
+        # Speaker embedding — always fp32 (fbank uses FFT, not supported in BF16)
+        ref_x_vector = self.speaker_encoder.inference(ref_wav_16.to(dtype=torch.float32))
 
         # Tokenize 16khz reference
         ref_speech_tokens, ref_speech_token_lens = self.tokenizer(ref_wav_16.float())
