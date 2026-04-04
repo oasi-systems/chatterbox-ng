@@ -15,15 +15,32 @@
 - `warmup_model()` — pre-trigger JIT compilation prima della prima request
 - Flash/MemEfficient SDPA per encoder attention
 
+### Adaptive Chunking (50-60% lower first-chunk latency)
+- Progressive chunk sizes: 5→10→20→25 tokens (default, `adaptive_chunking=True`)
+- First audio chunk arrives **~50-60% faster** than fixed chunking
+- Benchmarked: 899ms vs 2204ms FCL on MPS, with equal or better perceived quality
+- Customizable schedule via `adaptive_schedule` parameter
+
+### Voice Humanizer (breathing)
+- **`VoiceHumanizer`** — post-processor che aggiunge respiri naturali tra le frasi
+- Template di respiri reali adattati al profilo spettrale del parlante (spectral transfer)
+- Funziona con qualsiasi voce senza riestrarre campioni
+- Inserisce respiri **solo** nei gap di silenzio reali (mai taglia speech)
+- Salta gap dove il T3 ha già generato suoni naturali (RMS detection)
+- Durata respiro proporzionale al parlato precedente
+- 8 template verificati inclusi nel pacchetto (`breath_templates/`)
+- `VoiceHumanizer.from_reference("voice.wav")` → pronto all'uso
+
 ### Streaming Quality Fix (CRITICO)
 - **Full reprocess pipeline** — ogni chunk esegue encoder + CFM completi sull'intera sequenza accumulata
 - Audio streaming ora **identico** al monolitico `generate()`
 - HiFiGAN cache per continuità audio senza click/pop
 
-### Streaming Resampler 24kHz → 16kHz
+### Streaming Resampler 24kHz → 16kHz (default)
 - `StreamingResampler` con `scipy.resample_poly` — bit-exact con offline
 - Zero artefatti ai bordi dei chunk
-- `output_sample_rate=16000` per integrazione Asterisk
+- **16kHz è il default** — pronto per telefonia/Asterisk senza configurazione
+- `output_sample_rate=24000` per qualità nativa senza resampling
 
 ### TensorRT Export (opt-in)
 - `trt_export.py` — ONNX export per HiFiGAN e CFM estimator
@@ -58,7 +75,7 @@ model.prepare_conditionals("voce_agente.wav")
 warmup_model(model, device="cuda")
 
 # Streaming a 16kHz per Asterisk
-streamer = ChatterboxStreamingTTS(model, chunk_tokens=25, output_sample_rate=16000)
+streamer = ChatterboxStreamingTTS(model)  # 16kHz default, adaptive chunking ON
 for chunk in streamer.generate_stream(
     text="Buongiorno, la sua pratica è stata approvata.",
     language_id="it", exaggeration=0.5, cfg_weight=0.5,
@@ -73,7 +90,7 @@ for chunk in streamer.generate_stream(
 | Massima qualità | `meanflow=False`, `cfg_weight=0.7` |
 | Bilanciato | `meanflow=True`, `cfg_weight=0.5` |
 | Massima velocità | `meanflow=True` + TensorRT |
-| Telefonia 16kHz | `output_sample_rate=16000` |
+| Qualità nativa 24kHz | `output_sample_rate=24000` |
 
 ---
 

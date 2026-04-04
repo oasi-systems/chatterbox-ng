@@ -6,7 +6,7 @@ Il client riceve chunk audio PCM appena disponibili — zero attesa per la frase
 
 Architettura:
     Client WebSocket → {"text": "...", "voice": "sara"}
-    Server → chunk PCM 24kHz int16 in tempo reale
+    Server → chunk PCM 16kHz int16 in tempo reale
     Server → {"done": true, "duration": 4.2} al termine
 
 Produzione:
@@ -148,9 +148,7 @@ class TTSEngine:
 
             streamer = self.StreamingTTS(
                 self.model,
-                chunk_tokens=25,
-                min_initial_tokens=15,
-                output_sample_rate=self.sample_rate if self.sample_rate != 24000 else None,
+                output_sample_rate=self.sample_rate,
             )
 
             t_start = time.time()
@@ -271,8 +269,8 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--meanflow", action="store_true",
                         help="Use meanflow S3Gen (2 ODE steps, ~5x faster CFM)")
-    parser.add_argument("--output-sr", type=int, default=24000,
-                        help="Output sample rate (default: 24000, use 16000 for Asterisk)")
+    parser.add_argument("--output-sr", type=int, default=16000,
+                        help="Output sample rate (default: 16000 for telephony, use 24000 for full quality)")
     parser.add_argument("--tensorrt", default=None, metavar="DIR",
                         help="Directory with TRT/ONNX engines (from python -m chatterbox.trt_export)")
     args = parser.parse_args()

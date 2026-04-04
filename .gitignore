@@ -46,3 +46,5 @@ checkpoints/
 
 # Ignore generated sample .wav files
 **/*.wav
+# But keep breath templates (shipped with package)
+!src/chatterbox/breath_templates/*.wav

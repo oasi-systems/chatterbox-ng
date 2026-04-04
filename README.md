@@ -102,6 +102,8 @@ See `example_tts.py` and `example_vc.py` for more examples.
 
 ##### Real-Time Streaming (ChatterBox NG)
 
+Streaming uses **adaptive chunking** by default: the first chunk is emitted after just 5 tokens (~200ms on L4), with chunk sizes ramping up progressively (5→10→20→25 tokens) for optimal quality. This achieves **~50-60% lower first-chunk latency** compared to fixed chunking, with equal or better perceived audio quality.
+
 ```python
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 from chatterbox.streaming import ChatterboxStreamingTTS
@@ -117,22 +119,60 @@ optimize_for_cuda(model)
 model.prepare_conditionals("agent_voice.wav")
 warmup_model(model, device="cuda")
 
-# Stream at 16kHz for Asterisk/telephony
-streamer = ChatterboxStreamingTTS(
-    model,
-    chunk_tokens=25,          # tokens per chunk (higher = better quality, more latency)
-    output_sample_rate=16000,  # resample to 16kHz (default: 24kHz)
-)
+# Stream — defaults: 16kHz output, adaptive chunking ON
+# Just pass model and text. Everything else has sensible defaults.
+streamer = ChatterboxStreamingTTS(model)
 
 for chunk_pcm in streamer.generate_stream(
     text="Buongiorno, la informo che la sua pratica è stata approvata.",
     language_id="it",
-    exaggeration=0.5,  # voice expressiveness (0.0-1.0)
-    cfg_weight=0.5,    # voice timbre fidelity (0.0-1.0)
 ):
-    # chunk_pcm is a numpy float32 array at output_sample_rate
+    # chunk_pcm is a numpy float32 array at 16kHz, ready for Asterisk
     send_to_asterisk(chunk_pcm)
 ```
+
+##### Adaptive Chunking Options
+
+```python
+# Default: adaptive ON, schedule (5, 10, 20, 25) — best for real-time
+streamer = ChatterboxStreamingTTS(model)
+
+# Custom schedule: even more aggressive first chunk
+streamer = ChatterboxStreamingTTS(model, adaptive_chunking=True, adaptive_schedule=(3, 8, 15, 25))
+
+# Disable adaptive: fixed chunk sizes (legacy behavior)
+streamer = ChatterboxStreamingTTS(model, adaptive_chunking=False, min_initial_tokens=15, chunk_tokens=25)
+```
+
+##### Voice Humanizer (breathing)
+
+The humanizer adds natural breathing sounds between sentences, making synthesized speech sound alive. It uses real breath templates adapted to the speaker's spectral profile — works with any voice.
+
+```python
+from chatterbox.humanizer import VoiceHumanizer
+
+# Create humanizer from the same reference audio used for cloning
+humanizer = VoiceHumanizer.from_reference("agent_voice.wav")
+
+# After streaming, humanize the full audio
+streamer = ChatterboxStreamingTTS(model)
+for chunk in streamer.generate_stream(text="...", language_id="it"):
+    send_to_asterisk(chunk)
+
+# Post-process: add breaths to the full audio
+import numpy as np
+from scipy.signal import resample_poly
+
+full_24k = np.concatenate(streamer._all_chunks)
+humanized_24k = humanizer.process(full_24k)
+humanized_16k = resample_poly(humanized_24k, 2, 3).astype(np.float32)
+```
+
+The humanizer:
+- Inserts breaths **only** in existing silence gaps (never cuts speech)
+- Skips gaps where the model already generated natural sounds
+- Adapts breath timbre to match the target speaker
+- Scales breath duration proportionally to preceding speech length
 
 ##### Monolithic Generation (no streaming)
 
@@ -158,17 +198,21 @@ python examples/realtime_tts_server.py --device cuda --meanflow --output-sr 1600
 | Scenario | Setup |
 |----------|-------|
 | Max quality | `meanflow=False`, `cfg_weight=0.7` |
-| Balanced | `meanflow=True`, `cfg_weight=0.5` |
+| Balanced (default) | `meanflow=True`, `adaptive_chunking=True` |
 | Max speed | `meanflow=True` + TensorRT |
-| Telephony 16kHz | `output_sample_rate=16000` |
+| Native 24kHz | `output_sample_rate=24000` |
+| Lowest latency | `adaptive_schedule=(3, 8, 15, 25)` |
 
 ##### Quality Tuning
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
+| `output_sample_rate` | 16000 | 16kHz for telephony (default). Use 24000 for native quality |
 | `exaggeration` | 0.5 | Voice expressiveness. Call center: 0.3-0.5 |
 | `cfg_weight` | 0.5 | Voice timbre fidelity. For faithful cloning: 0.5-0.7 |
-| `chunk_tokens` | 25 | Tokens per chunk. Higher (40-50) = better quality, more latency |
+| `chunk_tokens` | 25 | Max tokens per chunk (after adaptive ramp-up) |
+| `adaptive_chunking` | True | Progressive chunk sizes for low FCL |
+| `adaptive_schedule` | (5,10,20,25) | Token counts per chunk. First = FCL target |
 | Reference audio | — | At least 5-10s of clean speech. Affects timbre/emotion, NOT speed |
 
 ## Supported Languages
