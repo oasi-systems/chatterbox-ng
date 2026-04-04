@@ -150,8 +150,6 @@ class TTSEngine:
                 self.model,
                 chunk_tokens=25,
                 min_initial_tokens=15,
-                streaming_cfm_steps=None,
-                use_cfm_windowing=True,
                 output_sample_rate=self.sample_rate if self.sample_rate != 24000 else None,
             )
 

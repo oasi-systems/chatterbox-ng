@@ -127,41 +127,36 @@ class ChatterboxStreamingTTS:
         model,
         chunk_tokens: int = 25,
         min_initial_tokens: int = 15,
-        streaming_cfm_steps: int = 4,
-        use_cfm_windowing: bool = True,
+        output_sample_rate: int = None,
+        # Deprecated — kept for API compat, ignored
+        streaming_cfm_steps: int = None,
+        use_cfm_windowing: bool = False,
         cfm_context_frames: int = 20,
         use_kv_cache: bool = False,
-        output_sample_rate: int = None,
     ):
         """
         Args:
             model: ChatterboxTTS, ChatterboxMultilingualTTS, or ChatterboxTurboTTS instance
             chunk_tokens: number of speech tokens to buffer before emitting audio (~40ms per token)
             min_initial_tokens: minimum tokens before first audio emission (higher = better first-chunk quality)
-            streaming_cfm_steps: CFM ODE steps for intermediate chunks (fewer = faster, lower quality).
-                Final chunk always uses full steps. Set to None to use model default.
-            use_cfm_windowing: if True, use CFM context window optimization.
-                Re-processes encoder fully (correct for bidirectional) but runs CFM only on
-                [context | new] frames with frozen context. Saves ~60-80% CFM cost.
-            cfm_context_frames: number of mel frames to freeze as CFM context (default: 20)
-            use_kv_cache: if True, use encoder KV-cache + CFM context window.
-                Deprecated — encoder KV-cache degrades quality with bidirectional encoder.
-                Use use_cfm_windowing instead.
             output_sample_rate: if set, resample output to this rate (e.g. 16000 for Asterisk).
                 Uses streaming polyphase resampler with zero boundary artifacts.
                 Default None = output at native 24kHz.
+
+        Note:
+            Streaming always uses full ODE steps (same as monolithic generate()).
+            For speed, use meanflow=True when loading the model — this uses 2 ODE steps
+            by design, without quality degradation. Never reduce ODE steps arbitrarily.
         """
         self.model = model
         self.chunk_tokens = chunk_tokens
         self.min_initial_tokens = min_initial_tokens
-        # With meanflow (2 ODE steps), intermediate chunks don't need reduced steps
-        if streaming_cfm_steps is not None and hasattr(model, 's3gen') and model.s3gen.meanflow:
-            self.streaming_cfm_steps = None  # let flow_inference use its 2-step default
-        else:
-            self.streaming_cfm_steps = streaming_cfm_steps
-        self.use_cfm_windowing = use_cfm_windowing
+        # Always use full ODE steps — quality must match monolithic.
+        # Speed comes from meanflow (2 steps by design), not from reducing steps.
+        self.streaming_cfm_steps = None
+        self.use_cfm_windowing = False
         self.cfm_context_frames = cfm_context_frames
-        self.use_kv_cache = use_kv_cache
+        self.use_kv_cache = False
 
         if output_sample_rate and output_sample_rate != S3GEN_SR:
             self._resampler = StreamingResampler(S3GEN_SR, output_sample_rate)
@@ -418,52 +413,24 @@ class ChatterboxStreamingTTS:
     ) -> Optional[np.ndarray]:
         """Run S3Gen on accumulated tokens and return new audio.
 
-        Three modes (selected by constructor flags):
-        1. use_cfm_windowing=True (default): Full encoder + CFM context window.
-           Correct bidirectional encoder, saves ~60-80% CFM cost.
-        2. use_kv_cache=True: Encoder KV-cache + CFM context window.
-           Fastest but degrades quality (stale KV from bidirectional encoder).
-        3. Neither: Full reprocessing (O(N²) encoder + O(N) CFM). Slowest but safest.
+        Uses full reprocessing: complete encoder + complete CFM on the full
+        [prompt|speech] sequence every chunk, identical to monolithic generate().
+        Only the new mel frames are vocoded via HiFiGAN with waveform cache
+        for continuity.
 
-        Uses reduced ODE steps for intermediate chunks (streaming_cfm_steps)
-        and full steps for the final chunk, balancing latency and quality.
+        This ensures streaming audio quality matches monolithic exactly.
+        Speed comes from meanflow (2 ODE steps by design), not from shortcuts.
         """
         all_tokens = torch.cat(accumulated_tokens, dim=0).unsqueeze(0).to(self.model.device)
 
-        # Use fewer ODE steps for intermediate chunks to reduce latency
-        effective_steps = n_cfm_timesteps
-        if effective_steps is None and not finalize and self.streaming_cfm_steps is not None:
-            effective_steps = self.streaming_cfm_steps
-
-        if self.use_kv_cache and hasattr(stream_state, 'encoder_caches') and stream_state.encoder_caches is not None:
-            # Legacy: encoder KV-cache + CFM window (deprecated, quality issues)
-            audio_chunk, updated_state = self.model.s3gen.streaming_step_cached(
-                all_tokens=all_tokens,
-                ref_dict=self.model.conds.gen,
-                state=stream_state,
-                finalize=finalize,
-                n_cfm_timesteps=effective_steps,
-                context_frames=self.cfm_context_frames,
-            )
-        elif self.use_cfm_windowing:
-            # Hybrid: full encoder + CFM context window (recommended)
-            audio_chunk, updated_state = self.model.s3gen.streaming_step_windowed(
-                all_tokens=all_tokens,
-                ref_dict=self.model.conds.gen,
-                state=stream_state,
-                finalize=finalize,
-                n_cfm_timesteps=effective_steps,
-                context_frames=self.cfm_context_frames,
-            )
-        else:
-            # Fallback: full reprocessing (slowest, highest quality)
-            audio_chunk, updated_state = self.model.s3gen.streaming_step(
-                all_tokens=all_tokens,
-                ref_dict=self.model.conds.gen,
-                state=stream_state,
-                finalize=finalize,
-                n_cfm_timesteps=effective_steps,
-            )
+        # Always use full ODE steps — same as monolithic generate()
+        audio_chunk, updated_state = self.model.s3gen.streaming_step(
+            all_tokens=all_tokens,
+            ref_dict=self.model.conds.gen,
+            state=stream_state,
+            finalize=finalize,
+            n_cfm_timesteps=n_cfm_timesteps,
+        )
 
         # Update state in-place (copy all fields from updated state)
         for attr in vars(updated_state):
