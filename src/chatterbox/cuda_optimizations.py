@@ -170,9 +170,14 @@ def _convert_to_bf16(model):
     torchaudio fbank which calls torch.fft.rfft — not supported in BF16.
     The fbank runs once per voice load, so fp32 there has zero perf impact.
     """
-    # S3Gen (flow encoder + CFM decoder + HiFiGAN)
-    if hasattr(model, 's3gen'):
-        model.s3gen.to(dtype=torch.bfloat16)
+    # S3Gen flow (encoder + CFM decoder) — safe for BF16
+    if hasattr(model, 's3gen') and hasattr(model.s3gen, 'flow'):
+        model.s3gen.flow.to(dtype=torch.bfloat16)
+
+    # HiFiGAN vocoder stays fp32 — STFT/ISTFT and SineGen phase
+    # accumulation need full precision to avoid metallic artifacts.
+    # HiFiGAN is only 5% of compute, so fp32 has negligible perf impact.
+    # (mel2wav is NOT converted)
 
     # T3 backbone
     if hasattr(model, 't3'):

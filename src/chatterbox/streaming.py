@@ -514,7 +514,7 @@ class ChatterboxStreamingTTS:
 
         # Insert breaths in real-time if humanizer is active
         if self._humanizer is not None:
-            chunk_np = self._humanize_chunk(chunk_np)
+            chunk_np = self._humanize_chunk(chunk_np, is_final=finalize)
 
         # Resample if output_sample_rate differs from native 24kHz
         if self._resampler is not None:
@@ -524,7 +524,7 @@ class ChatterboxStreamingTTS:
 
         return chunk_np
 
-    def _humanize_chunk(self, chunk: np.ndarray) -> np.ndarray:
+    def _humanize_chunk(self, chunk: np.ndarray, is_final: bool = False) -> np.ndarray:
         """Insert breaths into silence gaps within this chunk.
 
         Analyzes the chunk for silence gaps (≥200ms) and inserts a breath
@@ -532,6 +532,11 @@ class ChatterboxStreamingTTS:
         the last breath. Modifies chunk in-place.
 
         This runs at 24kHz (before resampling) so it adds negligible latency.
+
+        Args:
+            chunk: audio chunk at 24kHz
+            is_final: if True, this is the last chunk — don't insert breaths
+                in trailing silence (end of utterance, not a pause between phrases)
         """
         import librosa
 
@@ -554,16 +559,19 @@ class ChatterboxStreamingTTS:
             seg_dur = (seg_end - seg_start) / sr
             self._cumulative_speech_s += seg_dur
 
-            # Check gap AFTER this segment (if not last segment)
+            # Check gap AFTER this segment
             if i < len(intervals) - 1:
+                # Gap between two speech segments within this chunk
                 gap_start = seg_end
                 gap_end = intervals[i + 1][0]
-            elif seg_end < len(chunk):
-                # Gap at end of chunk (trailing silence)
+            else:
+                # Last segment in chunk — trailing silence
+                # Never insert breath at the end of the final chunk
+                # (that's end of utterance, not a pause between phrases)
+                if is_final or seg_end >= len(chunk):
+                    continue
                 gap_start = seg_end
                 gap_end = len(chunk)
-            else:
-                continue
 
             gap_dur = (gap_end - gap_start) / sr
             gap_time = chunk_time_start + gap_start / sr
