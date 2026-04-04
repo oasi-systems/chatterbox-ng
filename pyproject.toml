@@ -1,6 +1,6 @@
 [project]
 name = "chatterbox-ng"
-version = "0.2.0"
+version = "0.3.0"
 description = "ChatterBox NG: Next Generation TTS with Italian support, true streaming, and audio post-processing. Fork of Chatterbox by Resemble AI."
 readme = "README.md"
 requires-python = ">=3.10"

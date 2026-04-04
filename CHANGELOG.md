@@ -1,5 +1,82 @@
 # ChatterBox NG — Changelog
 
+## v0.3.0 — Production Real-Time Streaming on L4 (2026-04-04)
+
+> Ottimizzazione completa per telefonia italiana real-time su NVIDIA L4.
+> Streaming audio ora **identico** al monolitico `generate()`.
+
+### Meanflow S3Gen (5x CFM speedup)
+- Pesi turbo S3Gen (`s3gen_meanflow.safetensors`) caricabili nel modello multilingue
+- 2 ODE steps (vs 10), niente CFG batch doubling — **~5x speedup sulla parte CFM**
+- `ChatterboxMultilingualTTS.from_pretrained("cuda", meanflow=True)`
+
+### CUDA L4 Optimizations
+- `optimize_for_cuda()` — setup one-call: BF16, torch.compile, SDPA, TF32, cuDNN benchmark
+- `warmup_model()` — pre-trigger JIT compilation prima della prima request
+- Flash/MemEfficient SDPA per encoder attention
+
+### Streaming Quality Fix (CRITICO)
+- **Full reprocess pipeline** — ogni chunk esegue encoder + CFM completi sull'intera sequenza accumulata
+- Audio streaming ora **identico** al monolitico `generate()`
+- HiFiGAN cache per continuità audio senza click/pop
+
+### Streaming Resampler 24kHz → 16kHz
+- `StreamingResampler` con `scipy.resample_poly` — bit-exact con offline
+- Zero artefatti ai bordi dei chunk
+- `output_sample_rate=16000` per integrazione Asterisk
+
+### TensorRT Export (opt-in)
+- `trt_export.py` — ONNX export per HiFiGAN e CFM estimator
+- `trt_runtime.py` — wrappers drop-in TRT/ORT con fallback automatico
+- `pip install chatterbox-ng[tensorrt]`
+
+### WebSocket Server Aggiornato
+- `examples/realtime_tts_server.py` con flag `--meanflow`, `--output-sr`, `--tensorrt`
+- Client HTML integrato
+
+### Bug Fix
+- **fix: prompt_feat conditioning** — il decoder CFM riceveva `cond=zeros` invece del mel del reference audio, perdendo completamente l'identità vocale
+- **fix: ODE steps streaming** — step ridotti (4 vs 10) causavano distorsione grave; streaming ora usa sempre gli step completi del monolitico
+
+### Deprecati e Rimossi
+I seguenti parametri sono **ignorati** — causano tutti degradazione audio:
+- `streaming_cfm_steps` — usa sempre step completi
+- `use_cfm_windowing` — freeze corrompe consistenza ODE
+- `use_kv_cache` — encoder bidirezionale produce K/V stale
+
+### Come Usare
+
+```python
+from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+from chatterbox.streaming import ChatterboxStreamingTTS
+from chatterbox.cuda_optimizations import optimize_for_cuda, warmup_model
+
+# Carica con meanflow
+model = ChatterboxMultilingualTTS.from_pretrained("cuda", meanflow=True)
+optimize_for_cuda(model)
+model.prepare_conditionals("voce_agente.wav")
+warmup_model(model, device="cuda")
+
+# Streaming a 16kHz per Asterisk
+streamer = ChatterboxStreamingTTS(model, chunk_tokens=25, output_sample_rate=16000)
+for chunk in streamer.generate_stream(
+    text="Buongiorno, la sua pratica è stata approvata.",
+    language_id="it", exaggeration=0.5, cfg_weight=0.5,
+):
+    asterisk_channel.write(chunk)
+```
+
+### Configurazioni Performance
+
+| Scenario | Setup |
+|----------|-------|
+| Massima qualità | `meanflow=False`, `cfg_weight=0.7` |
+| Bilanciato | `meanflow=True`, `cfg_weight=0.5` |
+| Massima velocità | `meanflow=True` + TensorRT |
+| Telefonia 16kHz | `output_sample_rate=16000` |
+
+---
+
 ## v0.2.0 — Italian Support, True Streaming & Audio Post-Processing (2026-04-02)
 
 > First release as **ChatterBox NG** (Next Generation), fork of ChatterBox by Resemble AI.
