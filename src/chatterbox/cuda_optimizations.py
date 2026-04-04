@@ -164,33 +164,29 @@ def _set_cuda_flags():
 
 
 def _convert_to_bf16(model):
-    """Convert model components to bfloat16.
+    """Convert model to bfloat16 with surgical fp32 exceptions.
 
-    Note: Voice encoder stays fp32 because prepare_conditionals() uses
-    torchaudio fbank which calls torch.fft.rfft — not supported in BF16.
-    The fbank runs once per voice load, so fp32 there has zero perf impact.
+    Strategy: blanket-cast everything to BF16, then restore fp32 only
+    for components that use FFT (torch.fft.rfft / torch.stft) or need
+    full precision (HiFiGAN vocoder for phase accumulation).
     """
-    # S3Gen flow (encoder + CFM decoder) — safe for BF16
-    if hasattr(model, 's3gen') and hasattr(model.s3gen, 'flow'):
-        model.s3gen.flow.to(dtype=torch.bfloat16)
+    # 1. Blanket cast — all weights AND biases to BF16
+    model.to(dtype=torch.bfloat16)
 
-    # HiFiGAN vocoder stays fp32 — STFT/ISTFT and SineGen phase
-    # accumulation need full precision to avoid metallic artifacts.
+    # 2. Restore fp32 where needed:
+
+    # HiFiGAN vocoder — STFT/ISTFT and SineGen phase accumulation
+    # need full precision to avoid metallic artifacts.
     # HiFiGAN is only 5% of compute, so fp32 has negligible perf impact.
-    # (mel2wav is NOT converted)
+    if hasattr(model, 's3gen') and hasattr(model.s3gen, 'mel2wav'):
+        model.s3gen.mel2wav.to(dtype=torch.float32)
 
-    # T3 backbone
-    if hasattr(model, 't3'):
-        model.t3.to(dtype=torch.bfloat16)
-
-    # Voice encoder stays fp32 — fbank (FFT) doesn't support BF16
+    # Voice encoder — fbank uses torch.fft.rfft, not supported in BF16
     if hasattr(model, 've'):
         model.ve.to(dtype=torch.float32)
 
-    # Speaker encoder (xvector/CAMPPlus) stays fp32 — extract_feature()
-    # calls Kaldi.fbank which uses FFT, not supported in BF16.
-    # Note: speaker_encoder.inference() also casts input to fp32 internally,
-    # but embed_ref() must pass fp32 input to avoid FFT crash in extract_feature().
+    # Speaker encoder (xvector/CAMPPlus) — extract_feature() calls
+    # Kaldi.fbank which uses FFT, not supported in BF16.
     if hasattr(model, 's3gen') and hasattr(model.s3gen, 'speaker_encoder'):
         model.s3gen.speaker_encoder.to(dtype=torch.float32)
 
