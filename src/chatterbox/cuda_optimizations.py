@@ -194,6 +194,10 @@ def _convert_to_bf16(model):
     if hasattr(model, 's3gen') and hasattr(model.s3gen, 'speaker_encoder'):
         model.s3gen.speaker_encoder.to(dtype=torch.float32)
 
+    # S3 Tokenizer — uses STFT with mel_filters buffer, must stay fp32
+    if hasattr(model, 's3gen') and hasattr(model.s3gen, 'tokenizer'):
+        model.s3gen.tokenizer.to(dtype=torch.float32)
+
 
 def _convert_to_fp16(model):
     """Convert model components to float16."""
