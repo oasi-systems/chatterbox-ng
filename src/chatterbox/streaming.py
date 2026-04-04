@@ -211,6 +211,13 @@ class ChatterboxStreamingTTS:
         else:
             self._humanizer = None
 
+        # Crossfade buffer for seamless chunk boundaries
+        # HiFiGAN conv layers produce edge artifacts at chunk boundaries.
+        # We hold back a small overlap from each chunk and crossfade it with
+        # the beginning of the next chunk to eliminate clicks.
+        self._crossfade_samples = S3GEN_SR // 50  # 20ms = 480 samples at 24kHz
+        self._crossfade_buffer = None  # held-back tail of previous chunk
+
         # Humanizer streaming state
         self._cumulative_speech_s = 0.0
         self._last_breath_time_s = -999.0
@@ -319,6 +326,7 @@ class ChatterboxStreamingTTS:
         self._audio_emitted_s = 0.0
         self._rms_sum_sq = 0.0
         self._rms_n_samples = 0
+        self._crossfade_buffer = None
         if self._resampler is not None:
             self._resampler.reset()
         is_turbo = self._is_turbo()
@@ -396,6 +404,7 @@ class ChatterboxStreamingTTS:
         self._audio_emitted_s = 0.0
         self._rms_sum_sq = 0.0
         self._rms_n_samples = 0
+        self._crossfade_buffer = None
         if self._resampler is not None:
             self._resampler.reset()
         is_turbo = self._is_turbo()
@@ -520,6 +529,22 @@ class ChatterboxStreamingTTS:
             return None
 
         chunk_np = audio_chunk.squeeze(0).detach().cpu().numpy()
+
+        # Crossfade with previous chunk's tail to eliminate boundary clicks
+        cf = self._crossfade_samples
+        if self._crossfade_buffer is not None and len(chunk_np) > cf:
+            fade_in = np.linspace(0.0, 1.0, cf, dtype=np.float32)
+            fade_out = 1.0 - fade_in
+            chunk_np[:cf] = self._crossfade_buffer * fade_out + chunk_np[:cf] * fade_in
+
+        # Hold back tail for next crossfade (unless final chunk)
+        if not finalize and len(chunk_np) > cf:
+            self._crossfade_buffer = chunk_np[-cf:].copy()
+            chunk_np = chunk_np[:-cf]
+        else:
+            # Final chunk: flush everything, prepend any held-back buffer
+            self._crossfade_buffer = None
+
         self._all_chunks.append(chunk_np)
 
         # Insert breaths in real-time if humanizer is active
