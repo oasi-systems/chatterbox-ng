@@ -87,7 +87,9 @@ class T3CondEnc(nn.Module):
         cond_emotion_adv = empty  # (B, 0, dim)
         if self.hp.emotion_adv:
             assert cond.emotion_adv is not None
-            cond_emotion_adv = self.emotion_adv_fc(cond.emotion_adv.view(-1, 1, 1))
+            cond_emotion_adv = self.emotion_adv_fc(
+                cond.emotion_adv.view(-1, 1, 1).to(self.emotion_adv_fc.weight.dtype)
+            )
 
         # Concat and return
         cond_embeds = torch.cat((
