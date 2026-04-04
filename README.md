@@ -100,6 +100,77 @@ ta.save("test-2.wav", wav, model.sr)
 ```
 See `example_tts.py` and `example_vc.py` for more examples.
 
+##### Real-Time Streaming (ChatterBox NG)
+
+```python
+from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+from chatterbox.streaming import ChatterboxStreamingTTS
+from chatterbox.cuda_optimizations import optimize_for_cuda, warmup_model
+
+# Load with meanflow for 5x CFM speedup (2 ODE steps vs 10)
+model = ChatterboxMultilingualTTS.from_pretrained("cuda", meanflow=True)
+
+# CUDA optimizations: BF16 + torch.compile + SDPA + TF32
+optimize_for_cuda(model)
+
+# Load voice and warm up JIT kernels
+model.prepare_conditionals("agent_voice.wav")
+warmup_model(model, device="cuda")
+
+# Stream at 16kHz for Asterisk/telephony
+streamer = ChatterboxStreamingTTS(
+    model,
+    chunk_tokens=25,          # tokens per chunk (higher = better quality, more latency)
+    output_sample_rate=16000,  # resample to 16kHz (default: 24kHz)
+)
+
+for chunk_pcm in streamer.generate_stream(
+    text="Buongiorno, la informo che la sua pratica è stata approvata.",
+    language_id="it",
+    exaggeration=0.5,  # voice expressiveness (0.0-1.0)
+    cfg_weight=0.5,    # voice timbre fidelity (0.0-1.0)
+):
+    # chunk_pcm is a numpy float32 array at output_sample_rate
+    send_to_asterisk(chunk_pcm)
+```
+
+##### Monolithic Generation (no streaming)
+
+```python
+from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+
+model = ChatterboxMultilingualTTS.from_pretrained("cuda", meanflow=True)
+model.prepare_conditionals("voice.wav")
+
+wav = model.generate(text="Ciao, come stai?", language_id="it")
+# wav is a tensor (1, 1, N) at 24kHz
+```
+
+##### WebSocket Server
+
+```bash
+# Start real-time TTS server
+python examples/realtime_tts_server.py --device cuda --meanflow --output-sr 16000
+```
+
+##### Performance Configurations
+
+| Scenario | Setup |
+|----------|-------|
+| Max quality | `meanflow=False`, `cfg_weight=0.7` |
+| Balanced | `meanflow=True`, `cfg_weight=0.5` |
+| Max speed | `meanflow=True` + TensorRT |
+| Telephony 16kHz | `output_sample_rate=16000` |
+
+##### Quality Tuning
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `exaggeration` | 0.5 | Voice expressiveness. Call center: 0.3-0.5 |
+| `cfg_weight` | 0.5 | Voice timbre fidelity. For faithful cloning: 0.5-0.7 |
+| `chunk_tokens` | 25 | Tokens per chunk. Higher (40-50) = better quality, more latency |
+| Reference audio | — | At least 5-10s of clean speech. Affects timbre/emotion, NOT speed |
+
 ## Supported Languages
 Arabic (ar) • Danish (da) • German (de) • Greek (el) • English (en) • Spanish (es) • Finnish (fi) • French (fr) • Hebrew (he) • Hindi (hi) • Italian (it) • Japanese (ja) • Korean (ko) • Malay (ms) • Dutch (nl) • Norwegian (no) • Polish (pl) • Portuguese (pt) • Russian (ru) • Swedish (sv) • Swahili (sw) • Turkish (tr) • Chinese (zh)
 
