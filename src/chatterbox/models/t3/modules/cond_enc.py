@@ -66,8 +66,10 @@ class T3CondEnc(nn.Module):
         assert (cond.cond_prompt_speech_tokens is None) == (cond.cond_prompt_speech_emb is None), \
             "no embeddings for cond_prompt_speech_tokens"
 
-        # Speaker embedding projection
-        cond_spkr = self.spkr_enc(cond.speaker_emb.view(-1, self.hp.speaker_embed_size))[:, None]  # (B, 1, dim)
+        # Speaker embedding projection — cast to layer dtype to handle
+        # fp32 embeddings from voice encoder when T3 is in BF16
+        spkr_input = cond.speaker_emb.view(-1, self.hp.speaker_embed_size).to(self.spkr_enc.weight.dtype)
+        cond_spkr = self.spkr_enc(spkr_input)[:, None]  # (B, 1, dim)
         empty = torch.zeros_like(cond_spkr[:, :0])  # (B, 0, dim)
 
         # TODO CLAP
