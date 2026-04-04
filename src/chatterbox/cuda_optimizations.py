@@ -163,12 +163,51 @@ def _set_cuda_flags():
     logger.info(f"CUDA flags set: TF32=on, cuDNN benchmark=on, Flash SDPA=on ({gpu_name})")
 
 
+def _validate_dtypes(model, fp32_exceptions):
+    """Check that no nn.Module has mixed param/buffer dtypes after BF16 conversion.
+
+    Catches the exact class of bugs we kept hitting: weight in BF16 but bias in fp32,
+    or buffer in fp32 inside a BF16 module. Logs warnings for any mismatches found.
+    """
+    modules_to_check = []
+    if hasattr(model, 't3'):
+        modules_to_check.append(('t3', model.t3))
+    if hasattr(model, 's3gen'):
+        modules_to_check.append(('s3gen', model.s3gen))
+
+    for top_name, top_module in modules_to_check:
+        for name, module in top_module.named_modules():
+            full_name = f"{top_name}.{name}" if name else top_name
+
+            # Skip fp32 exception subtrees
+            if any(full_name.startswith(exc) for exc in fp32_exceptions):
+                continue
+
+            # Collect dtypes of all params and buffers in this leaf module
+            dtypes = {}
+            for pname, param in module.named_parameters(recurse=False):
+                dtypes[pname] = param.dtype
+            for bname, buf in module.named_buffers(recurse=False):
+                dtypes[bname] = buf.dtype
+
+            if not dtypes:
+                continue
+
+            unique = set(dtypes.values())
+            if len(unique) > 1:
+                logger.warning(
+                    f"Mixed dtypes in {full_name}: "
+                    + ", ".join(f"{k}={v}" for k, v in dtypes.items())
+                    + " — this will cause RuntimeError during forward pass"
+                )
+
+
 def _convert_to_bf16(model):
     """Convert model to bfloat16 with surgical fp32 exceptions.
 
-    Strategy: blanket-cast everything to BF16, then restore fp32 only
-    for components that use FFT (torch.fft.rfft / torch.stft) or need
-    full precision (HiFiGAN vocoder for phase accumulation).
+    Strategy: blanket-cast T3 and S3Gen to BF16, then restore fp32 for
+    components that use FFT/STFT or need full precision. Finally, validate
+    that no mixed-dtype parameters remain in any single module.
     """
     # 1. Blanket cast — all weights AND biases to BF16
     # Model wrapper is not nn.Module, so cast sub-modules individually
@@ -177,26 +216,31 @@ def _convert_to_bf16(model):
     if hasattr(model, 's3gen'):
         model.s3gen.to(dtype=torch.bfloat16)
 
-    # 2. Restore fp32 where needed:
-
-    # HiFiGAN vocoder — STFT/ISTFT and SineGen phase accumulation
-    # need full precision to avoid metallic artifacts.
-    # HiFiGAN is only 5% of compute, so fp32 has negligible perf impact.
-    if hasattr(model, 's3gen') and hasattr(model.s3gen, 'mel2wav'):
-        model.s3gen.mel2wav.to(dtype=torch.float32)
-
-    # Voice encoder — fbank uses torch.fft.rfft, not supported in BF16
+    # 2. Restore fp32 where needed (FFT/STFT/precision-sensitive):
+    _fp32_exceptions = []
+    if hasattr(model, 's3gen'):
+        s3 = model.s3gen
+        # HiFiGAN vocoder — STFT/ISTFT + SineGen phase accumulation
+        if hasattr(s3, 'mel2wav'):
+            s3.mel2wav.to(dtype=torch.float32)
+            _fp32_exceptions.append('s3gen.mel2wav')
+        # Speaker encoder — Kaldi.fbank (FFT)
+        if hasattr(s3, 'speaker_encoder'):
+            s3.speaker_encoder.to(dtype=torch.float32)
+            _fp32_exceptions.append('s3gen.speaker_encoder')
+        # S3 Tokenizer — torch.stft + mel_filters buffer
+        if hasattr(s3, 'tokenizer'):
+            s3.tokenizer.to(dtype=torch.float32)
+            _fp32_exceptions.append('s3gen.tokenizer')
+    # Voice encoder — fbank (FFT)
     if hasattr(model, 've'):
         model.ve.to(dtype=torch.float32)
+        _fp32_exceptions.append('ve')
 
-    # Speaker encoder (xvector/CAMPPlus) — extract_feature() calls
-    # Kaldi.fbank which uses FFT, not supported in BF16.
-    if hasattr(model, 's3gen') and hasattr(model.s3gen, 'speaker_encoder'):
-        model.s3gen.speaker_encoder.to(dtype=torch.float32)
+    logger.info(f"BF16 conversion: fp32 exceptions: {_fp32_exceptions}")
 
-    # S3 Tokenizer — uses STFT with mel_filters buffer, must stay fp32
-    if hasattr(model, 's3gen') and hasattr(model.s3gen, 'tokenizer'):
-        model.s3gen.tokenizer.to(dtype=torch.float32)
+    # 3. Validate: no module should have mixed param/buffer dtypes
+    _validate_dtypes(model, _fp32_exceptions)
 
 
 def _convert_to_fp16(model):
