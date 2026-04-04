@@ -281,7 +281,7 @@ class ChatterboxStreamingTTS:
         min_p: float = 0.05,
         top_p: float = 0.95,
         cfg_weight: float = 0.5,
-        exaggeration: float = 0.5,
+        exaggeration: float = 1.0,
         # Turbo-specific params
         top_k: int = 1000,
         # S3Gen params
