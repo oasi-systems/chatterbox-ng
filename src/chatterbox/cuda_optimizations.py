@@ -209,7 +209,21 @@ def _convert_to_bf16(model):
     components that use FFT/STFT or need full precision. Finally, validate
     that no mixed-dtype parameters remain in any single module.
     """
-    # 1. Blanket cast — all weights AND biases to BF16
+    # 1. Remove weight_norm before dtype cast — weight_norm stores weight as
+    # parametrization (weight_g, weight_v) which doesn't cast cleanly with .to().
+    # Fusing into a plain weight tensor first ensures .to(dtype) works correctly.
+    if hasattr(model, 's3gen') and hasattr(model.s3gen, 'mel2wav'):
+        if hasattr(model.s3gen.mel2wav, 'remove_weight_norm'):
+            model.s3gen.mel2wav.remove_weight_norm()
+        # f0_predictor's condnet also uses weight_norm
+        if hasattr(model.s3gen.mel2wav, 'f0_predictor'):
+            for module in model.s3gen.mel2wav.f0_predictor.modules():
+                try:
+                    torch.nn.utils.parametrize.remove_parametrizations(module, 'weight')
+                except ValueError:
+                    pass  # no parametrization on this module
+
+    # 2. Blanket cast — all weights, biases AND buffers to BF16
     # Model wrapper is not nn.Module, so cast sub-modules individually
     if hasattr(model, 't3'):
         model.t3.to(dtype=torch.bfloat16)
