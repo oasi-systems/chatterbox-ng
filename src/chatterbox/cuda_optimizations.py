@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 def optimize_for_cuda(
     model,
-    compile_mode: str = "max-autotune",
+    compile_mode: str = "default",
     use_bf16: bool = True,
     compile_models: bool = True,
     use_tensorrt: bool = False,
@@ -39,8 +39,10 @@ def optimize_for_cuda(
 
     Args:
         model: ChatterboxTTS, ChatterboxMultilingualTTS, or ChatterboxTurboTTS
-        compile_mode: torch.compile mode. "max-autotune" (best throughput, slow warmup)
-            or "reduce-overhead" (fast warmup, less fusion). Default: "max-autotune".
+        compile_mode: torch.compile mode. Default: "default" (kernel fusion without
+            CUDA graphs — safe for streaming with dynamic shapes).
+            "max-autotune" uses CUDA graphs and is INCOMPATIBLE with streaming
+            (crashes on dynamic tensor shapes). Only use for monolithic generate().
         use_bf16: convert to bfloat16 for 2x memory bandwidth
         compile_models: apply torch.compile to sub-modules
         use_tensorrt: replace HiFiGAN and CFM estimator with TRT/ORT engines
@@ -154,16 +156,20 @@ def _set_cuda_flags():
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-    # Disable math (fallback) SDPA — force hardware-accelerated paths
-    # This ensures we always use Flash or MemEfficient, never naive PyTorch
-    torch.backends.cuda.enable_math_sdp(False)
+    # Keep math SDPA as fallback — some shapes/dtypes can't use Flash/MemEfficient
+    torch.backends.cuda.enable_math_sdp(True)
 
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
     logger.info(f"CUDA flags set: TF32=on, cuDNN benchmark=on, Flash SDPA=on ({gpu_name})")
 
 
 def _convert_to_bf16(model):
-    """Convert model components to bfloat16."""
+    """Convert model components to bfloat16.
+
+    Note: Voice encoder stays fp32 because prepare_conditionals() uses
+    torchaudio fbank which calls torch.fft.rfft — not supported in BF16.
+    The fbank runs once per voice load, so fp32 there has zero perf impact.
+    """
     # S3Gen (flow encoder + CFM decoder + HiFiGAN)
     if hasattr(model, 's3gen'):
         model.s3gen.to(dtype=torch.bfloat16)
@@ -172,7 +178,13 @@ def _convert_to_bf16(model):
     if hasattr(model, 't3'):
         model.t3.to(dtype=torch.bfloat16)
 
-    # Voice encoder stays fp32 (used for embedding, not inference-critical)
+    # Voice encoder stays fp32 — fbank (FFT) doesn't support BF16
+    if hasattr(model, 've'):
+        model.ve.to(dtype=torch.float32)
+
+    # S3Gen's cond_encoder also uses fbank internally — keep fp32
+    if hasattr(model, 's3gen') and hasattr(model.s3gen, 'cond_encoder'):
+        model.s3gen.cond_encoder.to(dtype=torch.float32)
 
 
 def _convert_to_fp16(model):
@@ -191,38 +203,37 @@ def _compile_submodules(model, mode):
     - Generators can't be compiled
     - Sub-module compilation avoids these issues while still fusing kernels
 
+    IMPORTANT: "max-autotune" and "reduce-overhead" use CUDA graphs which
+    are INCOMPATIBLE with streaming (dynamic tensor shapes change each chunk).
+    Use "default" mode for streaming — it does kernel fusion via Triton
+    without CUDA graphs.
+
     Strategy by bottleneck analysis (profiled on L4):
-    - Encoder (53% of time): max-autotune — attention fusion is critical
-    - CFM estimator (29%): reduce-overhead — has .pop()/.append() dynamic list ops
-    - HiFiGAN (5%): reduce-overhead — lightweight, compile overhead not worth it
-    - T3 (13%): max-autotune — transformer backbone benefits from kernel fusion
+    - Encoder (53% of time): kernel fusion is critical
+    - CFM estimator (29%): benefits from fused attention + conv ops
+    - HiFiGAN (5%): lightweight, skip compile (overhead not worth it)
+    - T3 (13%): transformer backbone benefits from kernel fusion
     """
     try:
         if hasattr(model, 's3gen') and hasattr(model.s3gen, 'flow'):
             flow = model.s3gen.flow
 
-            # Encoder (53% bottleneck) — max-autotune for attention kernel fusion
+            # Encoder (53% bottleneck)
             flow.encoder = torch.compile(flow.encoder, mode=mode, dynamic=True)
             logger.info(f"  Compiled: S3Gen encoder (mode={mode})")
 
-            # CFM estimator (29%) — reduce-overhead because ConditionalDecoder
-            # has list .pop()/.append() and dynamic slicing that break graph tracing.
-            # reduce-overhead uses CUDA graphs which handle graph breaks gracefully.
-            estimator_mode = "reduce-overhead" if mode == "max-autotune" else mode
+            # CFM estimator (29%)
             if hasattr(flow, 'decoder') and hasattr(flow.decoder, 'estimator'):
                 flow.decoder.estimator = torch.compile(
-                    flow.decoder.estimator, mode=estimator_mode, dynamic=True
+                    flow.decoder.estimator, mode=mode, dynamic=True
                 )
-                logger.info(f"  Compiled: CFM decoder estimator (mode={estimator_mode})")
+                logger.info(f"  Compiled: CFM decoder estimator (mode={mode})")
 
-        # HiFiGAN vocoder (5%) — reduce-overhead, low-impact
-        if hasattr(model, 's3gen') and hasattr(model.s3gen, 'mel2wav'):
-            model.s3gen.mel2wav = torch.compile(
-                model.s3gen.mel2wav, mode="reduce-overhead", dynamic=True
-            )
-            logger.info("  Compiled: HiFiGAN vocoder (mode=reduce-overhead)")
+        # HiFiGAN vocoder (5%) — skip, not worth the compile overhead
+        # if hasattr(model, 's3gen') and hasattr(model.s3gen, 'mel2wav'):
+        #     model.s3gen.mel2wav = torch.compile(model.s3gen.mel2wav, mode=mode, dynamic=True)
 
-        # T3 backbone (LlamaModel or GPT2Model) — max-autotune
+        # T3 backbone (LlamaModel or GPT2Model)
         if hasattr(model, 't3') and hasattr(model.t3, 'tfmr'):
             model.t3.tfmr = torch.compile(model.t3.tfmr, mode=mode, dynamic=True)
             logger.info(f"  Compiled: T3 backbone (mode={mode})")
