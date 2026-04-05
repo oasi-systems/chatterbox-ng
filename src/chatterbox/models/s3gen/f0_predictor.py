@@ -50,6 +50,7 @@ class ConvRNNF0Predictor(nn.Module):
         self.classifier = nn.Linear(in_features=cond_channels, out_features=self.num_class)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.float()  # condnet is fp32 (precision needed for pitch estimation)
         x = self.condnet(x)
         x = x.transpose(1, 2)
         return torch.abs(self.classifier(x).squeeze(-1))
