@@ -137,7 +137,7 @@ class ChatterboxStreamingTTS:
         adaptive_schedule: tuple = None,  # e.g. (8, 15, 25) — token thresholds per chunk
         # Initial breath: emit a short breath before the first speech chunk
         # to mask cold-start artifacts (double consonant "BBuongiorno" etc.)
-        initial_breath: bool = True,
+        initial_breath: bool = False,
         initial_breath_duration_ms: int = 120,
         # Voice humanization: insert breaths between sentences in real-time
         humanize: bool = False,
