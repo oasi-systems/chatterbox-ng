@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -116,6 +117,13 @@ class S3Token2Mel(torch.nn.Module):
     def dtype(self):
         params = self.flow.parameters()
         return next(params).dtype
+
+    def _autocast_ctx(self):
+        """Return autocast context if configured, else nullcontext."""
+        dtype = getattr(self, '_autocast_dtype', None)
+        if dtype and self.device != 'cpu' and torch.cuda.is_available():
+            return torch.autocast('cuda', dtype=dtype)
+        return nullcontext()
 
     def embed_ref(
         self,
@@ -321,7 +329,7 @@ class S3Token2Wav(S3Token2Mel):
             mel_len = speech_tokens.size(-1) * 2
             if not finalize:
                 mel_len -= self.flow.pre_lookahead_len * self.flow.token_mel_ratio
-            noise = torch.randn(1, 80, mel_len, dtype=self.dtype, device=self.device)
+            noise = torch.randn(1, 80, mel_len, device=self.device)
         output_mels = super().forward(
             speech_tokens, speech_token_lens=speech_token_lens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict,
             n_cfm_timesteps=n_cfm_timesteps, finalize=finalize, noised_mels=noise,
@@ -385,13 +393,35 @@ class S3Token2Wav(S3Token2Mel):
         # Projected speaker embedding (cached after first chunk)
         spk_embedding_proj: torch.Tensor = None     # (B, 80) projected
 
-    def init_streaming(self) -> 'S3Token2Wav.StreamState':
-        """Initialize streaming state. Call once before streaming tokens."""
+    def init_streaming(self, ref_dict: dict = None) -> 'S3Token2Wav.StreamState':
+        """Initialize streaming state. Call once before streaming tokens.
+
+        Args:
+            ref_dict: reference audio embeddings from embed_ref(). If provided,
+                seeds the HiFiGAN cache from the reference audio tail to eliminate
+                cold-start artifacts on the first chunk.
+        """
+        # HiFiGAN cache is always fp32 (vocoder runs in fp32)
+        hifi_cache = torch.zeros(1, 1, 0, device=self.device, dtype=torch.float32)
+
+        # Seed cache from reference audio to warm HiFiGAN conv layers
+        if ref_dict is not None and 'prompt_feat' in ref_dict:
+            prompt_feat = ref_dict['prompt_feat']  # (B, mel_len, 80)
+            warmup_frames = min(5, prompt_feat.shape[1])
+            warmup_mel = prompt_feat[:, -warmup_frames:].transpose(1, 2)  # (B, 80, frames)
+            with torch.inference_mode():
+                _, warmup_source = self.mel2wav.inference(
+                    speech_feat=warmup_mel.float(),
+                    cache_source=torch.zeros(1, 1, 0, device=self.device),
+                )
+            cache_len = min(warmup_source.shape[2], S3GEN_SR // 10)
+            hifi_cache = warmup_source[:, :, -cache_len:]
+
         return S3Token2Wav.StreamState(
-            hifi_cache_source=torch.zeros(1, 1, 0, device=self.device, dtype=self.dtype),
+            hifi_cache_source=hifi_cache,
             prev_stable_mel_len=0,
             is_first_chunk=True,
-            encoder_caches=self.flow.encoder.init_caches(self.device, self.dtype),
+            encoder_caches=self.flow.encoder.init_caches(self.device, torch.float32),
         )
 
     @torch.inference_mode()
@@ -418,14 +448,14 @@ class S3Token2Wav(S3Token2Mel):
         """
         all_tokens = torch.atleast_2d(all_tokens)
 
-        # Generate mel for ALL accumulated tokens
-        output_mels = self.flow_inference(
-            speech_tokens=all_tokens,
-            ref_dict=ref_dict,
-            finalize=finalize,
-            n_cfm_timesteps=n_cfm_timesteps,
-        )
-        output_mels = output_mels.to(dtype=self.dtype)
+        with self._autocast_ctx():
+            # Generate mel for ALL accumulated tokens
+            output_mels = self.flow_inference(
+                speech_tokens=all_tokens,
+                ref_dict=ref_dict,
+                finalize=finalize,
+                n_cfm_timesteps=n_cfm_timesteps,
+            )
 
         total_mel_len = output_mels.shape[2]
 
@@ -438,23 +468,17 @@ class S3Token2Wav(S3Token2Mel):
         new_mels = output_mels[:, :, state.prev_stable_mel_len:]
 
         # Run HiFiGAN on new mel frames with cache for continuity
-        # Estimate source length from mel frames to prevent cache overflow
-        # (HiFiGAN upsamples mel by 8*5*3=120x, so source_len ≈ mel_len * 120)
+        # HiFiGAN runs in fp32 (STFT/phase precision) — outside autocast.
         estimated_source_len = new_mels.shape[2] * 120
         cache = state.hifi_cache_source
         if cache.shape[2] > estimated_source_len:
             cache = cache[:, :, -estimated_source_len:]
         # Deterministic SineGen phase for streaming continuity.
-        # SineGen samples random phase offsets per harmonic on each forward() call.
-        # In streaming, different phases per chunk cause harmonic discontinuities
-        # at chunk boundaries (metallic/harsh artifacts). By seeding the RNG to the
-        # same value before each mel2wav call, every chunk gets identical phase
-        # offsets — combined with cache_source overlap, this gives seamless audio.
         rng_state = torch.random.get_rng_state()
         torch.manual_seed(42)
         audio_chunk, new_source = self.mel2wav.inference(
-            speech_feat=new_mels,
-            cache_source=cache,
+            speech_feat=new_mels.float(),
+            cache_source=cache.float(),
         )
         torch.random.set_rng_state(rng_state)
 

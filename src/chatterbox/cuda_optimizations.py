@@ -2,11 +2,12 @@
 CUDA/GPU optimizations for ChatterBox TTS models.
 
 Provides:
-- BF16 inference precision with TF32 matmul
-- torch.compile() on critical sub-modules (max-autotune for kernel fusion)
+- torch.autocast for automatic mixed-precision (BF16/FP16) inference
+- torch.compile() on critical sub-modules (kernel fusion)
 - SDPA (Scaled Dot-Product Attention) upgrade for encoder attention
 - Flash Attention / Memory-Efficient SDPA backend selection
 - CUDA-specific flags (cuDNN benchmark, TF32)
+- Weight norm removal for clean inference
 - Warmup pass to trigger JIT compilation before serving
 
 Usage:
@@ -65,13 +66,13 @@ def optimize_for_cuda(
     # --- CUDA backend flags ---
     _set_cuda_flags()
 
-    # --- BF16 ---
+    # --- Mixed precision via autocast ---
     if use_bf16 and torch.cuda.is_bf16_supported():
-        logger.info("Converting to bfloat16...")
-        _convert_to_bf16(model)
+        logger.info("Enabling autocast (bfloat16)...")
+        _setup_autocast(model, torch.bfloat16)
     elif use_bf16:
-        logger.info("BF16 not supported on this GPU, using fp16...")
-        _convert_to_fp16(model)
+        logger.info("BF16 not supported, enabling autocast (float16)...")
+        _setup_autocast(model, torch.float16)
 
     # --- TensorRT / ONNX Runtime acceleration ---
     if use_tensorrt:
@@ -163,108 +164,40 @@ def _set_cuda_flags():
     logger.info(f"CUDA flags set: TF32=on, cuDNN benchmark=on, Flash SDPA=on ({gpu_name})")
 
 
-def _validate_dtypes(model, fp32_exceptions):
-    """Check that no nn.Module has mixed param/buffer dtypes after BF16 conversion.
+def _setup_autocast(model, dtype):
+    """Configure model for torch.autocast mixed-precision inference.
 
-    Catches the exact class of bugs we kept hitting: weight in BF16 but bias in fp32,
-    or buffer in fp32 inside a BF16 module. Logs warnings for any mismatches found.
+    Instead of manually casting weights to bf16/fp16 (which requires explicit
+    fp32 exceptions and boundary casts everywhere), we keep all weights in fp32
+    and let torch.autocast handle precision automatically per-op:
+    - matmul, conv, linear → bf16 (fast on Tensor Cores)
+    - FFT, STFT, layernorm, softmax → stays fp32 (needs precision)
+
+    This eliminates all dtype mismatch bugs and is the foundation for TensorRT.
+
+    We also remove weight_norm parametrizations as a standalone optimization
+    (fusing weight_g/weight_v into a single weight tensor for faster inference).
     """
-    modules_to_check = []
-    if hasattr(model, 't3'):
-        modules_to_check.append(('t3', model.t3))
-    if hasattr(model, 's3gen'):
-        modules_to_check.append(('s3gen', model.s3gen))
-
-    for top_name, top_module in modules_to_check:
-        for name, module in top_module.named_modules():
-            full_name = f"{top_name}.{name}" if name else top_name
-
-            # Skip fp32 exception subtrees
-            if any(full_name.startswith(exc) for exc in fp32_exceptions):
-                continue
-
-            # Collect dtypes of all params and buffers in this leaf module
-            dtypes = {}
-            for pname, param in module.named_parameters(recurse=False):
-                dtypes[pname] = param.dtype
-            for bname, buf in module.named_buffers(recurse=False):
-                dtypes[bname] = buf.dtype
-
-            if not dtypes:
-                continue
-
-            unique = set(dtypes.values())
-            if len(unique) > 1:
-                logger.warning(
-                    f"Mixed dtypes in {full_name}: "
-                    + ", ".join(f"{k}={v}" for k, v in dtypes.items())
-                    + " — this will cause RuntimeError during forward pass"
-                )
-
-
-def _convert_to_bf16(model):
-    """Convert model to bfloat16 with surgical fp32 exceptions.
-
-    Strategy: blanket-cast T3 and S3Gen to BF16, then restore fp32 for
-    components that use FFT/STFT or need full precision. Finally, validate
-    that no mixed-dtype parameters remain in any single module.
-    """
-    # 1. Remove ALL weight_norm parametrizations before dtype cast.
-    # weight_norm (both old and new style) stores weight as parametrization
-    # (weight_g, weight_v) which doesn't cast cleanly with .to(dtype).
-    # Fusing into a plain weight tensor first ensures correct casting.
+    # Remove weight_norm parametrizations — standalone optimization.
+    # Fuses weight_g/weight_v into a plain weight tensor.
     for top_attr in ('s3gen', 't3'):
         top = getattr(model, top_attr, None)
         if top is None:
             continue
         for module in top.modules():
-            # New-style parametrization (torch.nn.utils.parametrizations.weight_norm)
             if torch.nn.utils.parametrize.is_parametrized(module, 'weight'):
                 try:
                     torch.nn.utils.parametrize.remove_parametrizations(module, 'weight')
                 except Exception:
                     pass
 
-    # 2. Blanket cast — all weights, biases AND buffers to BF16
-    # Model wrapper is not nn.Module, so cast sub-modules individually
+    # Store autocast config on sub-modules — used by inference entry points
+    if hasattr(model, 's3gen'):
+        model.s3gen._autocast_dtype = dtype
     if hasattr(model, 't3'):
-        model.t3.to(dtype=torch.bfloat16)
-    if hasattr(model, 's3gen'):
-        model.s3gen.to(dtype=torch.bfloat16)
-
-    # 2. Restore fp32 where needed (FFT/STFT/precision-sensitive):
-    _fp32_exceptions = []
-    if hasattr(model, 's3gen'):
-        s3 = model.s3gen
-        # HiFiGAN vocoder — STFT/ISTFT + SineGen phase accumulation
-        if hasattr(s3, 'mel2wav'):
-            s3.mel2wav.to(dtype=torch.float32)
-            _fp32_exceptions.append('s3gen.mel2wav')
-        # Speaker encoder — Kaldi.fbank (FFT)
-        if hasattr(s3, 'speaker_encoder'):
-            s3.speaker_encoder.to(dtype=torch.float32)
-            _fp32_exceptions.append('s3gen.speaker_encoder')
-        # S3 Tokenizer — torch.stft + mel_filters buffer
-        if hasattr(s3, 'tokenizer'):
-            s3.tokenizer.to(dtype=torch.float32)
-            _fp32_exceptions.append('s3gen.tokenizer')
-    # Voice encoder — fbank (FFT)
-    if hasattr(model, 've'):
-        model.ve.to(dtype=torch.float32)
-        _fp32_exceptions.append('ve')
-
-    logger.info(f"BF16 conversion: fp32 exceptions: {_fp32_exceptions}")
-
-    # 3. Validate: no module should have mixed param/buffer dtypes
-    _validate_dtypes(model, _fp32_exceptions)
-
-
-def _convert_to_fp16(model):
-    """Convert model components to float16."""
-    if hasattr(model, 's3gen'):
-        model.s3gen.to(dtype=torch.float16)
-    if hasattr(model, 't3'):
-        model.t3.to(dtype=torch.float16)
+        model.t3._autocast_dtype = dtype
+    model._autocast_dtype = dtype
+    logger.info(f"Autocast configured: dtype={dtype}, weights stay fp32")
 
 
 def _compile_submodules(model, mode):

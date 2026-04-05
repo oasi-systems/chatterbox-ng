@@ -341,8 +341,8 @@ class ChatterboxStreamingTTS:
         # --- Tokenize text ---
         text_tokens = self._tokenize_text(text, language_id, device)
 
-        # --- Initialize streaming state ---
-        stream_state = self.model.s3gen.init_streaming()
+        # --- Initialize streaming state (seed HiFiGAN from reference audio) ---
+        stream_state = self.model.s3gen.init_streaming(ref_dict=self.model.conds.gen)
         accumulated_tokens = []
 
         # --- Start T3 streaming ---
@@ -419,7 +419,7 @@ class ChatterboxStreamingTTS:
         logger.info(f"Sentence pipelining: {len(sentences)} sentence(s)")
 
         # Shared S3Gen state across all sentences for audio continuity
-        stream_state = self.model.s3gen.init_streaming()
+        stream_state = self.model.s3gen.init_streaming(ref_dict=self.model.conds.gen)
 
         for sent_idx, sentence in enumerate(sentences):
             is_last_sentence = (sent_idx == len(sentences) - 1)
