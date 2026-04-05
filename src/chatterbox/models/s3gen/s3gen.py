@@ -464,23 +464,42 @@ class S3Token2Wav(S3Token2Mel):
         if new_mel_len <= 0:
             return None, state
 
-        # Extract only the NEW mel frames
-        new_mels = output_mels[:, :, state.prev_stable_mel_len:]
+        # --- HiFiGAN with mel context window ---
+        # HiFiGAN's conv layers (conv_pre kernel=7, resblocks kernel=11 dilation=5)
+        # need left context to avoid edge artifacts.  Without context, the first
+        # few mel frames of each chunk produce metallic/distorted audio.
+        # We pass HIFI_CONTEXT_FRAMES of previous mel frames as context, then
+        # trim the corresponding audio from the output.
+        HIFI_CONTEXT_FRAMES = 10  # ~107ms at 10.67ms/frame
+        SAMPLES_PER_MEL_FRAME = 256  # upsample 8×8 × ISTFT hop 4 = 256
 
-        # Run HiFiGAN on new mel frames with cache for continuity
-        # HiFiGAN runs in fp32 (STFT/phase precision) — outside autocast.
-        estimated_source_len = new_mels.shape[2] * 120
+        ctx_start = max(0, state.prev_stable_mel_len - HIFI_CONTEXT_FRAMES)
+        ctx_frames = state.prev_stable_mel_len - ctx_start  # actual context used
+        hifi_input = output_mels[:, :, ctx_start:]  # context + new mel frames
+
+        # Source signal cache should cover the context region
+        # so HiFiGAN's source network transitions smoothly.
         cache = state.hifi_cache_source
+        estimated_source_len = hifi_input.shape[2] * SAMPLES_PER_MEL_FRAME
         if cache.shape[2] > estimated_source_len:
             cache = cache[:, :, -estimated_source_len:]
+
+        # HiFiGAN runs in fp32 (STFT/phase precision) — outside autocast.
         # Deterministic SineGen phase for streaming continuity.
         rng_state = torch.random.get_rng_state()
         torch.manual_seed(42)
-        audio_chunk, new_source = self.mel2wav.inference(
-            speech_feat=new_mels.float(),
+        audio_full, new_source = self.mel2wav.inference(
+            speech_feat=hifi_input.float(),
             cache_source=cache.float(),
         )
         torch.random.set_rng_state(rng_state)
+
+        # Trim context audio — keep only the NEW audio portion
+        ctx_audio_samples = ctx_frames * SAMPLES_PER_MEL_FRAME
+        if ctx_audio_samples > 0 and audio_full.shape[1] > ctx_audio_samples:
+            audio_chunk = audio_full[:, ctx_audio_samples:]
+        else:
+            audio_chunk = audio_full
 
         # Apply trim fade only on first chunk to reduce reference spillover
         if state.is_first_chunk:
@@ -488,7 +507,7 @@ class S3Token2Wav(S3Token2Mel):
             audio_chunk[:, :trim_len] *= self.trim_fade[:trim_len]
 
         # Update state
-        # Keep last portion of source signal for cache continuity
+        # Keep source signal for cache continuity (covers context + margin)
         cache_len = min(new_source.shape[2], S3GEN_SR // 10)  # ~100ms cache
         state.hifi_cache_source = new_source[:, :, -cache_len:]
         state.prev_stable_mel_len = total_mel_len
