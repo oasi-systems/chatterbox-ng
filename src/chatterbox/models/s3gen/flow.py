@@ -163,7 +163,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         # Align token tensor and token_len — they can diverge by 1-2 when
         # prompt_token has padding. Truncate tensor to match length (not the
         # other way around) so encoder/decoder get consistent shapes.
-        actual_len = token_len[0].item()
+        actual_len = int(token_len[0].item())
         if token.shape[1] > actual_len:
             token = token[:, :actual_len]
         elif token.shape[1] < actual_len:
