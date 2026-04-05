@@ -287,25 +287,17 @@ def _compile_submodules(model, mode):
     - T3 (13%): transformer backbone benefits from kernel fusion
     """
     try:
-        if hasattr(model, 's3gen') and hasattr(model.s3gen, 'flow'):
-            flow = model.s3gen.flow
-
-            # Encoder (53% bottleneck)
-            flow.encoder = torch.compile(flow.encoder, mode=mode, dynamic=True)
-            logger.info(f"  Compiled: S3Gen encoder (mode={mode})")
-
-            # CFM estimator (29%)
-            if hasattr(flow, 'decoder') and hasattr(flow.decoder, 'estimator'):
-                flow.decoder.estimator = torch.compile(
-                    flow.decoder.estimator, mode=mode, dynamic=True
-                )
-                logger.info(f"  Compiled: CFM decoder estimator (mode={mode})")
+        # S3Gen flow (encoder + CFM estimator) — NOT compiled.
+        # Streaming re-encodes ALL accumulated tokens each chunk, so the
+        # encoder input shape grows every call. torch.compile with dynamic=True
+        # still fails on shape-dependent operations (clamp, make_pad_mask).
+        # The 53% + 29% = 82% of S3Gen time runs in eager mode.
+        # Future: TensorRT with dynamic shape profiles can handle this.
 
         # HiFiGAN vocoder (5%) — skip, not worth the compile overhead
-        # if hasattr(model, 's3gen') and hasattr(model.s3gen, 'mel2wav'):
-        #     model.s3gen.mel2wav = torch.compile(model.s3gen.mel2wav, mode=mode, dynamic=True)
 
-        # T3 backbone (LlamaModel or GPT2Model)
+        # T3 backbone (LlamaModel or GPT2Model) — safe to compile.
+        # T3 generates one token at a time (fixed shape per step).
         if hasattr(model, 't3') and hasattr(model.t3, 'tfmr'):
             model.t3.tfmr = torch.compile(model.t3.tfmr, mode=mode, dynamic=True)
             logger.info(f"  Compiled: T3 backbone (mode={mode})")
