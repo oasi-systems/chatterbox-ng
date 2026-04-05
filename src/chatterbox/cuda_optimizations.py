@@ -209,19 +209,21 @@ def _convert_to_bf16(model):
     components that use FFT/STFT or need full precision. Finally, validate
     that no mixed-dtype parameters remain in any single module.
     """
-    # 1. Remove weight_norm before dtype cast — weight_norm stores weight as
-    # parametrization (weight_g, weight_v) which doesn't cast cleanly with .to().
-    # Fusing into a plain weight tensor first ensures .to(dtype) works correctly.
-    if hasattr(model, 's3gen') and hasattr(model.s3gen, 'mel2wav'):
-        if hasattr(model.s3gen.mel2wav, 'remove_weight_norm'):
-            model.s3gen.mel2wav.remove_weight_norm()
-        # f0_predictor's condnet also uses weight_norm
-        if hasattr(model.s3gen.mel2wav, 'f0_predictor'):
-            for module in model.s3gen.mel2wav.f0_predictor.modules():
+    # 1. Remove ALL weight_norm parametrizations before dtype cast.
+    # weight_norm (both old and new style) stores weight as parametrization
+    # (weight_g, weight_v) which doesn't cast cleanly with .to(dtype).
+    # Fusing into a plain weight tensor first ensures correct casting.
+    for top_attr in ('s3gen', 't3'):
+        top = getattr(model, top_attr, None)
+        if top is None:
+            continue
+        for module in top.modules():
+            # New-style parametrization (torch.nn.utils.parametrizations.weight_norm)
+            if torch.nn.utils.parametrize.is_parametrized(module, 'weight'):
                 try:
                     torch.nn.utils.parametrize.remove_parametrizations(module, 'weight')
-                except ValueError:
-                    pass  # no parametrization on this module
+                except Exception:
+                    pass
 
     # 2. Blanket cast — all weights, biases AND buffers to BF16
     # Model wrapper is not nn.Module, so cast sub-modules individually
