@@ -461,6 +461,8 @@ class HiFTGenerator(nn.Module):
 
     @torch.inference_mode()
     def inference(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+        speech_feat = speech_feat.float()  # HiFiGAN is fp32 (STFT/phase precision)
+        cache_source = cache_source.float()
         # mel->f0
         f0 = self.f0_predictor(speech_feat)
         # f0->source
