@@ -448,14 +448,18 @@ class S3Token2Wav(S3Token2Mel):
         """
         all_tokens = torch.atleast_2d(all_tokens)
 
-        with self._autocast_ctx():
-            # Generate mel for ALL accumulated tokens
-            output_mels = self.flow_inference(
-                speech_tokens=all_tokens,
-                ref_dict=ref_dict,
-                finalize=finalize,
-                n_cfm_timesteps=n_cfm_timesteps,
-            )
+        # --- Flow inference in fp32 (NOT autocast) ---
+        # Autocast causes mel output in bf16 (7-bit mantissa ≈ 42dB dynamic range).
+        # Mel spectrograms need ~80dB range → bf16 quantization creates metallic
+        # harmonics. The monolithic path runs flow_inference in fp32; streaming
+        # must do the same for quality parity.
+        # Speed comes from meanflow (2 ODE steps), not from reduced precision.
+        output_mels = self.flow_inference(
+            speech_tokens=all_tokens,
+            ref_dict=ref_dict,
+            finalize=finalize,
+            n_cfm_timesteps=n_cfm_timesteps,
+        )
 
         total_mel_len = output_mels.shape[2]
 
@@ -467,20 +471,21 @@ class S3Token2Wav(S3Token2Mel):
         # Extract only the NEW mel frames
         new_mels = output_mels[:, :, state.prev_stable_mel_len:]
 
-        # Run HiFiGAN on new mel frames with cache for continuity
-        # HiFiGAN runs in fp32 (STFT/phase precision) — outside autocast.
-        estimated_source_len = new_mels.shape[2] * 120
+        # Run HiFiGAN on new mel frames with cache for continuity.
+        # HiFiGAN runs in fp32 (STFT/phase precision).
+        #
+        # Source signal length = mel_frames × f0_upsamp_scale.
+        # f0_upsamp_scale = prod(upsample_rates) × istft_hop = 120 × 4 = 480.
+        SOURCE_PER_MEL = 480
+        estimated_source_len = new_mels.shape[2] * SOURCE_PER_MEL
         cache = state.hifi_cache_source
         if cache.shape[2] > estimated_source_len:
             cache = cache[:, :, -estimated_source_len:]
-        # Deterministic SineGen phase for streaming continuity.
-        rng_state = torch.random.get_rng_state()
-        torch.manual_seed(42)
+
         audio_chunk, new_source = self.mel2wav.inference(
             speech_feat=new_mels.float(),
             cache_source=cache.float(),
         )
-        torch.random.set_rng_state(rng_state)
 
         # Apply trim fade only on first chunk to reduce reference spillover
         if state.is_first_chunk:
@@ -488,9 +493,10 @@ class S3Token2Wav(S3Token2Mel):
             audio_chunk[:, :trim_len] *= self.trim_fade[:trim_len]
 
         # Update state
-        # Keep last portion of source signal for cache continuity
-        cache_len = min(new_source.shape[2], S3GEN_SR // 10)  # ~100ms cache
-        state.hifi_cache_source = new_source[:, :, -cache_len:]
+        # Keep full source signal for cache — ensures SineGen phase continuity
+        # across chunk boundaries. Previous 100ms cap caused phase jumps at
+        # the cache→fresh boundary, producing metallic artifacts.
+        state.hifi_cache_source = new_source
         state.prev_stable_mel_len = total_mel_len
         state.is_first_chunk = False
 
