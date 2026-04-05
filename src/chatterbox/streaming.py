@@ -17,6 +17,7 @@ Sentence pipelining mode:
     but audio is emitted continuously with HiFiGAN cache maintaining waveform continuity.
 """
 import logging
+import os
 import re as _re
 from typing import Generator, Tuple, Union, Optional, List
 
@@ -30,6 +31,9 @@ from math import gcd
 from .models.s3tokenizer import drop_invalid_tokens, SPEECH_VOCAB_SIZE
 from .models.s3gen import S3GEN_SR
 from .models.t3.modules.cond_enc import T3Cond
+
+# Built-in breath templates directory
+_BREATH_TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), 'breath_templates')
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +135,10 @@ class ChatterboxStreamingTTS:
         # Adaptive chunking: start with small chunks for low FCL, grow for quality
         adaptive_chunking: bool = True,
         adaptive_schedule: tuple = None,  # e.g. (8, 15, 25) — token thresholds per chunk
+        # Initial breath: emit a short breath before the first speech chunk
+        # to mask cold-start artifacts (double consonant "BBuongiorno" etc.)
+        initial_breath: bool = True,
+        initial_breath_duration_ms: int = 120,
         # Voice humanization: insert breaths between sentences in real-time
         humanize: bool = False,
         humanizer_reference: str = None,  # path to reference audio for breath adaptation
@@ -211,6 +219,11 @@ class ChatterboxStreamingTTS:
         else:
             self._humanizer = None
 
+        # Initial breath config
+        self._initial_breath = initial_breath
+        self._initial_breath_duration_ms = initial_breath_duration_ms
+        self._breath_templates_cache = None  # lazy-loaded
+
         # Crossfade buffer for seamless chunk boundaries
         # HiFiGAN conv layers produce edge artifacts at chunk boundaries.
         # We hold back a small overlap from each chunk and crossfade it with
@@ -230,6 +243,70 @@ class ChatterboxStreamingTTS:
 
     def _is_turbo(self):
         return hasattr(self.model, 't3') and self.model.t3.is_gpt
+
+    def _load_breath_templates(self):
+        """Lazy-load breath templates from the built-in directory."""
+        if self._breath_templates_cache is not None:
+            return self._breath_templates_cache
+
+        import librosa
+        templates = []
+        if os.path.isdir(_BREATH_TEMPLATES_DIR):
+            for fname in sorted(os.listdir(_BREATH_TEMPLATES_DIR)):
+                if fname.endswith('.wav') and 'breath' in fname.lower():
+                    path = os.path.join(_BREATH_TEMPLATES_DIR, fname)
+                    audio, _ = librosa.load(path, sr=S3GEN_SR)
+                    templates.append(audio)
+        if templates:
+            logger.info(f"Loaded {len(templates)} breath templates for initial breath")
+        else:
+            logger.warning("No breath templates found — initial breath disabled")
+        self._breath_templates_cache = templates
+        return templates
+
+    def _get_initial_breath(self) -> Optional[np.ndarray]:
+        """Get a short breath to emit before the first speech chunk.
+
+        Returns breath audio at output_sample_rate, or None if unavailable.
+        """
+        if not self._initial_breath:
+            return None
+
+        templates = self._load_breath_templates()
+        if not templates:
+            return None
+
+        # Pick a random template
+        rng = np.random.default_rng()
+        idx = rng.integers(0, len(templates))
+        breath = templates[idx].copy()
+
+        # Trim to target duration
+        target_samples = int(self._initial_breath_duration_ms / 1000 * S3GEN_SR)
+        if len(breath) > target_samples:
+            breath = breath[:target_samples]
+
+        # Gentle fade in/out (5ms) to avoid clicks
+        fade = int(0.005 * S3GEN_SR)
+        if len(breath) > 2 * fade:
+            breath[:fade] *= np.linspace(0, 1, fade, dtype=np.float32)
+            breath[-fade:] *= np.linspace(1, 0, fade, dtype=np.float32)
+
+        # Scale to a soft level (breaths are quiet)
+        rms = np.sqrt(np.mean(breath ** 2))
+        if rms > 0:
+            breath *= 0.03 / rms  # target RMS ~0.03 (soft breath)
+
+        # Resample to output rate if needed
+        if self._resampler is not None:
+            # Use a one-shot resample (not the streaming resampler state)
+            import torchaudio
+            breath_t = torch.from_numpy(breath).unsqueeze(0)
+            resampler = torchaudio.transforms.Resample(S3GEN_SR, self.sample_rate)
+            breath_t = resampler(breath_t)
+            breath = breath_t.squeeze(0).numpy()
+
+        return breath.astype(np.float32)
 
     def _tokenize_text(self, text: str, language_id: Optional[str], device):
         """Normalize and tokenize text, adding SOT/EOT."""
@@ -290,7 +367,7 @@ class ChatterboxStreamingTTS:
         min_p: float = 0.05,
         top_p: float = 0.95,
         cfg_weight: float = 0.5,
-        exaggeration: float = 1.0,
+        exaggeration: float = 0.7,
         # Turbo-specific params
         top_k: int = 1000,
         # S3Gen params
@@ -344,6 +421,11 @@ class ChatterboxStreamingTTS:
         # --- Initialize streaming state (seed HiFiGAN from reference audio) ---
         stream_state = self.model.s3gen.init_streaming(ref_dict=self.model.conds.gen)
         accumulated_tokens = []
+
+        # --- Emit initial breath (masks cold-start artifacts like "BBuongiorno") ---
+        initial_breath = self._get_initial_breath()
+        if initial_breath is not None:
+            yield initial_breath
 
         # --- Start T3 streaming ---
         token_gen = self._start_t3_stream(
@@ -420,6 +502,11 @@ class ChatterboxStreamingTTS:
 
         # Shared S3Gen state across all sentences for audio continuity
         stream_state = self.model.s3gen.init_streaming(ref_dict=self.model.conds.gen)
+
+        # --- Emit initial breath before first sentence ---
+        initial_breath = self._get_initial_breath()
+        if initial_breath is not None:
+            yield initial_breath
 
         for sent_idx, sentence in enumerate(sentences):
             is_last_sentence = (sent_idx == len(sentences) - 1)
