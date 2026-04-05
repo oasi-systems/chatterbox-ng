@@ -160,15 +160,9 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
 
         # concat text and prompt_text
         token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
-        # Align token tensor and token_len — they can diverge by 1-2 when
-        # prompt_token has padding. Truncate tensor to match length (not the
-        # other way around) so encoder/decoder get consistent shapes.
-        actual_len = int(token_len[0].item())
-        if token.shape[1] > actual_len:
-            token = token[:, :actual_len]
-        elif token.shape[1] < actual_len:
-            token_len = torch.tensor([token.shape[1]], device=token_len.device)
-        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+        # make_pad_mask must match token tensor shape — extra positions (from
+        # prompt padding) are naturally masked to zero. No truncation needed.
+        mask = (~make_pad_mask(token_len, max_len=token.shape[1])).unsqueeze(-1).to(embedding)
 
         if (token >= self.vocab_size).any():
             logger.error(f"{token.max()}>{self.vocab_size}\n out-of-range special tokens found in flow, fix inputs!")
@@ -189,7 +183,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         conds[:, :mel_len1] = prompt_feat
         conds = conds.transpose(1, 2)
 
-        mask = (~make_pad_mask(h_lengths)).unsqueeze(1).to(h)
+        mask = (~make_pad_mask(h_lengths, max_len=h.shape[1])).unsqueeze(1).to(h)
 
         if mask.shape[0] != B:
             mask = mask.repeat(B, 1, 1)
@@ -251,7 +245,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
 
         # concat [prompt | speech]
         token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
-        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+        mask = (~make_pad_mask(token_len, max_len=token.shape[1])).unsqueeze(-1).to(embedding)
 
         if (token >= self.vocab_size).any():
             logger.error(f"{token.max()}>{self.vocab_size}\n out-of-range special tokens found in flow, fix inputs!")
@@ -309,7 +303,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         # Full token sequence: [prompt | speech]
         all_token = torch.concat([prompt_token, token], dim=1)
         all_token_len = prompt_token_len + token_len
-        mask = (~make_pad_mask(all_token_len)).unsqueeze(-1).to(embedding)
+        mask = (~make_pad_mask(all_token_len, max_len=all_token.shape[1])).unsqueeze(-1).to(embedding)
 
         if (all_token >= self.vocab_size).any():
             logger.error(f"{all_token.max()}>{self.vocab_size}\n out-of-range special tokens found in flow, fix inputs!")
