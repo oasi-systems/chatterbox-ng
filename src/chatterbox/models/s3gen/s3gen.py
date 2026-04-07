@@ -615,6 +615,137 @@ class S3Token2Wav(S3Token2Mel):
         return audio_chunk, state
 
     @torch.inference_mode()
+    def streaming_step_efficient(
+        self,
+        all_tokens: torch.Tensor,
+        ref_dict: dict,
+        state: 'S3Token2Wav.StreamState',
+        finalize: bool = False,
+        n_cfm_timesteps: int = None,
+        cfm_context_frames: int = 30,
+    ) -> Tuple[Optional[torch.Tensor], 'S3Token2Wav.StreamState']:
+        """O(1)-per-step streaming: full encoder + windowed CFM decoder.
+
+        The CFM UNet estimator is the main streaming bottleneck. Instead of
+        running it on the full [prompt | all_speech] mel sequence (cost grows
+        with utterance length), this method runs it only on a small window of
+        [context_frames + new_frames] (constant cost per step).
+
+        On the FIRST chunk, full CFM is used (prompt_feat conditioning needed
+        for voice identity initialization). On subsequent chunks, the windowed
+        path kicks in — voice identity is maintained by the speaker embedding
+        (global) and context continuity from previously generated mel.
+
+        The encoder still runs on the full sequence (bidirectional Conformer
+        needs full context). Encoder cost is O(N²) per step but is much
+        cheaper than CFM: ~12 Conformer layers vs UNet estimator.
+
+        Args:
+            all_tokens: ALL speech tokens generated so far
+            ref_dict: reference audio embeddings
+            state: streaming state from init_streaming()
+            finalize: True when EOS reached
+            n_cfm_timesteps: ODE steps (default: 2 for meanflow)
+            cfm_context_frames: mel frames of context for windowed CFM (default 30 = 300ms)
+        """
+        n_cfm_timesteps = n_cfm_timesteps or (2 if self.meanflow else 10)
+        all_tokens = torch.atleast_2d(all_tokens)
+
+        # Prepare ref_dict tensors
+        prompt_token = ref_dict['prompt_token'].to(self.device, dtype=torch.long)
+        prompt_token_len = ref_dict['prompt_token_len'].to(self.device)
+        prompt_feat = ref_dict['prompt_feat'].to(self.device, dtype=self.dtype)
+        embedding = ref_dict['embedding'].to(self.device, dtype=self.dtype)
+
+        speech_token_lens = torch.LongTensor([all_tokens.size(-1)]).to(self.device)
+
+        # --- Step 1: Full encoder (bidirectional, correct) ---
+        full_mu, spk_emb, prompt_mel_len = self.flow.encode_only(
+            token=all_tokens,
+            token_len=speech_token_lens,
+            prompt_token=prompt_token,
+            prompt_token_len=prompt_token_len,
+            prompt_feat=prompt_feat,
+            embedding=embedding,
+            finalize=finalize,
+        )
+        # full_mu: (B, 80, prompt_mel + speech_mel)
+
+        total_speech_mel = full_mu.size(2) - prompt_mel_len
+        new_mel_frames = total_speech_mel - state.prev_stable_mel_len
+
+        if new_mel_frames <= 0:
+            return None, state
+
+        # --- Step 2: CFM decoding ---
+        if state.cached_mel is not None and state.cached_mel.size(2) > 0:
+            # WINDOWED CFM: only process [context + new] frames (O(1) cost)
+            C = min(cfm_context_frames, state.cached_mel.size(2))
+            context_mel = state.cached_mel[:, :, -C:].to(dtype=full_mu.dtype)
+
+            # Extract mu for context + new speech positions
+            mu_start = prompt_mel_len + (total_speech_mel - new_mel_frames - C)
+            mu_window = full_mu[:, :, mu_start:]
+
+            new_mel = self.flow.decode_cfm_windowed(
+                mu_window=mu_window,
+                spk_embedding=spk_emb,
+                context_mel=context_mel,
+                n_timesteps=n_cfm_timesteps,
+                meanflow=self.meanflow,
+            )
+        else:
+            # FIRST CHUNK: full CFM with prompt_feat conditioning.
+            # Voice identity initialization requires prompt context.
+            noise = torch.randn(1, 80, full_mu.size(2), device=self.device, dtype=full_mu.dtype)
+            output_mels, _ = self.flow.decoder(
+                mu=full_mu,
+                mask=torch.ones(1, 1, full_mu.size(2), device=self.device, dtype=full_mu.dtype),
+                spks=spk_emb,
+                cond=torch.cat([
+                    prompt_feat.transpose(1, 2).contiguous().to(full_mu.dtype),
+                    torch.zeros(1, 80, total_speech_mel, device=self.device, dtype=full_mu.dtype),
+                ], dim=2),
+                n_timesteps=n_cfm_timesteps,
+                noised_mels=noise,
+                meanflow=self.meanflow,
+            )
+            # Extract speech-only mel
+            new_mel = output_mels[:, :, prompt_mel_len:]
+
+        new_mel = new_mel.to(dtype=self.dtype)
+
+        # Accumulate generated mel for future context
+        if state.cached_mel is not None:
+            state.cached_mel = torch.cat([state.cached_mel, new_mel], dim=2)
+        else:
+            state.cached_mel = new_mel
+
+        # --- Step 3: HiFiGAN vocoding ---
+        SOURCE_PER_MEL = 480
+        estimated_source_len = new_mel.shape[2] * SOURCE_PER_MEL
+        cache = state.hifi_cache_source
+        if cache.shape[2] > estimated_source_len:
+            cache = cache[:, :, -estimated_source_len:]
+
+        audio_chunk, new_source = self.mel2wav.inference(
+            speech_feat=new_mel.float(),
+            cache_source=cache.float(),
+        )
+
+        # Apply trim fade on first chunk
+        if state.is_first_chunk:
+            trim_len = min(len(self.trim_fade), audio_chunk.shape[1])
+            audio_chunk[:, :trim_len] *= self.trim_fade[:trim_len]
+
+        # Update state
+        state.hifi_cache_source = new_source
+        state.prev_stable_mel_len = total_speech_mel
+        state.is_first_chunk = False
+
+        return audio_chunk, state
+
+    @torch.inference_mode()
     def streaming_step_cached(
         self,
         all_tokens: torch.Tensor,

@@ -145,8 +145,9 @@ class ChatterboxStreamingTTS:
         # Deprecated — kept for API compat, ignored
         streaming_cfm_steps: int = None,
         use_cfm_windowing: bool = False,
-        cfm_context_frames: int = 20,
+        cfm_context_frames: int = 30,
         use_kv_cache: bool = False,
+        efficient_streaming: bool = True,
     ):
         """
         Args:
@@ -189,6 +190,11 @@ class ChatterboxStreamingTTS:
         self.use_cfm_windowing = False
         self.cfm_context_frames = cfm_context_frames
         self.use_kv_cache = False
+
+        # Efficient streaming: windowed CFM decoder (O(1) per step instead of O(N²)).
+        # Uses full encoder (correct bidirectional) + CFM on [context + new] frames only.
+        # First chunk uses full CFM for voice identity, subsequent chunks use windowed.
+        self.efficient_streaming = efficient_streaming
 
         if output_sample_rate and output_sample_rate != S3GEN_SR:
             self._resampler = StreamingResampler(S3GEN_SR, output_sample_rate)
@@ -723,24 +729,31 @@ class ChatterboxStreamingTTS:
     ) -> Optional[np.ndarray]:
         """Run S3Gen on accumulated tokens and return new audio.
 
-        Uses full reprocessing: complete encoder + complete CFM on the full
-        [prompt|speech] sequence every chunk, identical to monolithic generate().
-        Only the new mel frames are vocoded via HiFiGAN with waveform cache
-        for continuity.
+        By default uses efficient streaming: full encoder + windowed CFM on
+        [context + new] frames only (O(1) per step). Falls back to full
+        reprocessing if efficient_streaming is disabled.
 
-        This ensures streaming audio quality matches monolithic exactly.
-        Speed comes from meanflow (2 ODE steps by design), not from shortcuts.
+        Speed comes from meanflow (2 ODE steps by design) + windowed CFM.
         """
         all_tokens = torch.cat(accumulated_tokens, dim=0).unsqueeze(0).to(self.model.device)
 
-        # Always use full ODE steps — same as monolithic generate()
-        audio_chunk, updated_state = self.model.s3gen.streaming_step(
-            all_tokens=all_tokens,
-            ref_dict=self.model.conds.gen,
-            state=stream_state,
-            finalize=finalize,
-            n_cfm_timesteps=n_cfm_timesteps,
-        )
+        if self.efficient_streaming:
+            audio_chunk, updated_state = self.model.s3gen.streaming_step_efficient(
+                all_tokens=all_tokens,
+                ref_dict=self.model.conds.gen,
+                state=stream_state,
+                finalize=finalize,
+                n_cfm_timesteps=n_cfm_timesteps,
+                cfm_context_frames=self.cfm_context_frames,
+            )
+        else:
+            audio_chunk, updated_state = self.model.s3gen.streaming_step(
+                all_tokens=all_tokens,
+                ref_dict=self.model.conds.gen,
+                state=stream_state,
+                finalize=finalize,
+                n_cfm_timesteps=n_cfm_timesteps,
+            )
 
         # Update state in-place (copy all fields from updated state)
         for attr in vars(updated_state):

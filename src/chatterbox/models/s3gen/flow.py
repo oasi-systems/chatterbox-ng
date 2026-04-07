@@ -399,3 +399,66 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
 
         # Extract only NEW speech frames (after prompt + previously generated)
         return feat[:, :, freeze_len:]
+
+    @torch.inference_mode()
+    def decode_cfm_windowed(
+        self,
+        mu_window: torch.Tensor,
+        spk_embedding: torch.Tensor,
+        context_mel: torch.Tensor,
+        n_timesteps: int = 2,
+        meanflow: bool = True,
+    ) -> torch.Tensor:
+        """Run CFM decoder on a WINDOWED [context | new] speech sequence.
+
+        Instead of processing the full [prompt | all_speech] mel sequence
+        (O(N) per ODE step × N steps), processes only [context | new] frames
+        (O(1) per step). This is the key optimization for O(N) streaming.
+
+        For speech positions, the CFM conditioning (cond) is always zeros —
+        voice identity comes from the global speaker embedding (spks), not
+        from prompt_feat. So windowed CFM on speech-only frames produces
+        equivalent results when context >= ~30 frames (300ms).
+
+        Args:
+            mu_window: (B, 80, C+N) — encoder output for context + new positions
+            spk_embedding: (B, 80) — projected speaker embedding
+            context_mel: (B, 80, C) — previously generated mel for context frames
+            n_timesteps: ODE steps (default 2 for meanflow)
+            meanflow: whether to use meanflow mode
+
+        Returns:
+            new_mel: (B, 80, N) — generated mel for new frames only
+        """
+        C = context_mel.size(2)
+        total = mu_window.size(2)
+        N = total - C
+
+        # Build noised_mels covering the FULL window [context_mel | noise].
+        # CausalConditionalCFM.forward() does: prompt_len = mu.size(2) - noised_mels.size(2)
+        # By passing noised_mels of full size, prompt_len=0, so z = noised_mels entirely.
+        # freeze_len=C then correctly freezes context_mel during ODE integration.
+        noised_mels = torch.randn(1, 80, total, device=mu_window.device, dtype=mu_window.dtype)
+        noised_mels[:, :, :C] = context_mel
+
+        # cond: zeros for all positions (speech frames have no prompt_feat)
+        cond = torch.zeros_like(mu_window)
+
+        # mask: all valid
+        mask = torch.ones(1, 1, total, device=mu_window.device, dtype=mu_window.dtype)
+
+        # Call decoder forward — it builds z with context + noise, runs ODE
+        # with freeze_len to reset context frames after each step.
+        feat, _ = self.decoder(
+            mu=mu_window,
+            mask=mask,
+            spks=spk_embedding,
+            cond=cond,
+            n_timesteps=n_timesteps,
+            noised_mels=noised_mels,
+            meanflow=meanflow,
+            freeze_len=C,
+        )
+
+        # Return only new frames
+        return feat[:, :, C:]
