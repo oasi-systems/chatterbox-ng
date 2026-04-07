@@ -1,0 +1,33 @@
+# ============================================================================
+# German Telephony — Pronunciation Dictionary
+# ============================================================================
+# Note: German names (Schmidt, Müller, etc.) are native — NO respelling needed.
+#
+# Usage:
+#   g2p.dictionary.load_yaml("dictionaries/german_telephony.yaml", language_id="de")
+# ============================================================================
+
+# --- English Names ---
+Smith: "smiss"
+McDonald: "mekdonalt"
+
+# --- Acronyms (German spelling-out) ---
+WiFi: "wai fai"
+USB: "u es be"
+GPS: "ge pe es"
+PDF: "pe de ef"
+CEO: "ze i ou"
+SMS: "es em es"
+ATM: "a te em"
+
+# --- Telephony Terms ---
+callback: "kollbäck"
+helpdesk: "helpdesk"
+hotline: "hotlein"
+voicemail: "woismeil"
+roaming: "roaming"
+smartphone: "smartfon"
+bluetooth: "blutuhs"
+password: "passwörd"
+streaming: "strihming"
+cloud: "klaud"

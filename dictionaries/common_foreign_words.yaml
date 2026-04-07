@@ -1,0 +1,26 @@
+# ============================================================================
+# Common Foreign Words — GLOBAL Respelling Dictionary
+# ============================================================================
+# Only acronyms and abbreviations that are spelled the same in all languages.
+# For language-specific respellings (names, English words), use per-language files.
+#
+# Usage:
+#   g2p.dictionary.load_yaml("dictionaries/common_foreign_words.yaml")
+# ============================================================================
+
+# --- Financial/Banking (universal acronyms) ---
+IBAN: "i ban"
+SEPA: "sepa"
+SWIFT: "svift"
+BIC: "bic"
+PIN: "pin"
+POS: "pos"
+
+# --- Technology (universal) ---
+LED: "led"
+RAM: "ram"
+SIM: "sim"
+NATO: "nato"
+UNESCO: "unesko"
+UNICEF: "unichef"
+FIFA: "fifa"

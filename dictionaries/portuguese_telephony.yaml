@@ -1,0 +1,36 @@
+# ============================================================================
+# Portuguese Telephony — Pronunciation Dictionary
+# ============================================================================
+# Usage:
+#   g2p.dictionary.load_yaml("dictionaries/portuguese_telephony.yaml", language_id="pt")
+# ============================================================================
+
+# --- German Names ---
+Schmidt: "esmit"
+Schwartz: "esvarts"
+Müller: "miuler"
+
+# --- English Names ---
+Smith: "esmit"
+McDonald: "mécdonald"
+
+# --- Acronyms (Portuguese spelling-out) ---
+WiFi: "uai fai"
+USB: "u ésse bê"
+GPS: "jê pê ésse"
+PDF: "pê dê éfe"
+CEO: "cê e ó"
+SMS: "ésse ême ésse"
+ATM: "a tê ême"
+
+# --- Telephony Terms ---
+callback: "colbéc"
+helpdesk: "rélpdésc"
+hotline: "rotlain"
+voicemail: "voismeil"
+roaming: "romin"
+smartphone: "ismartfon"
+bluetooth: "blutus"
+password: "pássuord"
+streaming: "istrimin"
+cloud: "claud"

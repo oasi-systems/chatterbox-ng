@@ -1,0 +1,56 @@
+# ============================================================================
+# Italian Telephony — Pronunciation Dictionary
+# ============================================================================
+# REGOLA: usare PAROLE ITALIANE REALI, mai inventare non-parole.
+# Per acronimi: espandere nel significato italiano.
+# Per nomi stranieri: respelling fonetico con ortografia italiana valida.
+# ============================================================================
+
+# --- Acronimi → espansione in italiano ---
+CEO: "amministratore delegato"
+CFO: "direttore finanziario"
+CTO: "direttore tecnico"
+COO: "direttore operativo"
+HR: "risorse umane"
+PR: "relazioni pubbliche"
+KPI: "indicatore di performance"
+ROI: "ritorno sull'investimento"
+FAQ: "domande frequenti"
+IBAN: "iban"
+SEPA: "sepa"
+PIN: "pin"
+POS: "pos"
+CVV: "codice di sicurezza"
+WiFi: "uaifai"
+USB: "u esse bi"
+GPS: "gipies"
+PDF: "pidieffe"
+SMS: "essemmesse"
+ATM: "bancomat"
+SIM: "sim"
+QR: "cu erre"
+B2B: "bi tu bi"
+B2C: "bi tu ci"
+NATO: "nato"
+ONU: "onu"
+
+# --- Parole inglesi che il modello pronuncia male ---
+compliance: "complaians"
+
+# --- German Names (sch/tz/ü non esistono in italiano) ---
+Schmidt: "shmit"
+Schwartz: "shvarts"
+Schneider: "shnaider"
+Müller: "miuller"
+Schröder: "shreder"
+Wagner: "vagner"
+Fischer: "fisher"
+Weber: "veber"
+Hoffmann: "ofman"
+Schulz: "shults"
+Schwarz: "shvarts"
+Zimmermann: "tsimmerman"
+Krüger: "criugher"
+Hartmann: "artman"
+Werner: "verner"
+Schmitt: "shmit"

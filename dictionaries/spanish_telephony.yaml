@@ -1,0 +1,37 @@
+# ============================================================================
+# Spanish Telephony — Pronunciation Dictionary
+# ============================================================================
+# Usage:
+#   g2p.dictionary.load_yaml("dictionaries/spanish_telephony.yaml", language_id="es")
+# ============================================================================
+
+# --- German Names ---
+Schmidt: "esmit"
+Schwartz: "esvarts"
+Müller: "miuler"
+Schneider: "esnaider"
+
+# --- English Names ---
+Smith: "esmit"
+McDonald: "macdonal"
+
+# --- Acronyms (Spanish spelling-out) ---
+WiFi: "guai fai"
+USB: "u ese be"
+GPS: "ye pe ese"
+PDF: "pe de efe"
+CEO: "ce e o"
+SMS: "ese eme ese"
+ATM: "a te eme"
+
+# --- Telephony Terms ---
+callback: "colbac"
+helpdesk: "jelpdesc"
+hotline: "jotlain"
+voicemail: "voismeil"
+roaming: "roamin"
+smartphone: "esmarfon"
+bluetooth: "blutus"
+password: "pasguord"
+streaming: "estrimin"
+cloud: "claud"

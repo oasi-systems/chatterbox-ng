@@ -1,0 +1,39 @@
+# ============================================================================
+# French Telephony — Pronunciation Dictionary
+# ============================================================================
+# Usage:
+#   g2p.dictionary.load_yaml("dictionaries/french_telephony.yaml", language_id="fr")
+# ============================================================================
+
+# --- German Names ---
+Schmidt: "chmitt"
+Schwartz: "chvartss"
+Müller: "muleur"
+Schneider: "chnaideur"
+Schröder: "chrédeur"
+
+# --- English Names ---
+Smith: "smiss"
+McDonald: "mecdonald"
+
+# --- Acronyms (French spelling-out) ---
+WiFi: "oui fi"
+USB: "u ès bé"
+GPS: "jé pé ès"
+PDF: "pé dé èf"
+CEO: "cé i o"
+SMS: "ès èm ès"
+ATM: "a té èm"
+FAQ: "èf a ku"
+
+# --- Telephony Terms ---
+callback: "colbak"
+helpdesk: "èlpdèsk"
+hotline: "otlain"
+voicemail: "voicemèil"
+roaming: "roming"
+smartphone: "smartfone"
+bluetooth: "bloutousse"
+password: "passouorde"
+streaming: "striming"
+cloud: "claoud"

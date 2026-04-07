@@ -254,16 +254,39 @@ def add_russian_stress(text: str) -> str:
 
 
 class MTLTokenizer:
-    def __init__(self, vocab_file_path):
+    # EU languages that support phoneme mode
+    PHONEME_LANGUAGES = {'en', 'fr', 'de', 'es', 'pt', 'it'}
+
+    def __init__(self, vocab_file_path, phoneme_mode=False):
         self.tokenizer: Tokenizer = Tokenizer.from_file(vocab_file_path)
         model_dir = Path(vocab_file_path).parent
         self.cangjie_converter = ChineseCangjieConverter(model_dir)
         self.check_vocabset_sot_eot()
 
+        # Phoneme encoding support
+        self.phoneme_mode = phoneme_mode
+        self._phoneme_token_to_id = None  # lazy init
+
     def check_vocabset_sot_eot(self):
         voc = self.tokenizer.get_vocab()
         assert SOT in voc
         assert EOT in voc
+
+    def _init_phoneme_tokens(self):
+        """Lazily build phoneme token → ID mapping."""
+        if self._phoneme_token_to_id is not None:
+            return
+        from chatterbox.phoneme_tokens import get_all_new_tokens
+
+        bpe_vocab_size = self.tokenizer.get_vocab_size()
+        new_tokens = get_all_new_tokens()
+        self._phoneme_token_to_id = {}
+        for i, token_name in enumerate(new_tokens):
+            self._phoneme_token_to_id[token_name] = bpe_vocab_size + i
+        logger.info(
+            f"Phoneme tokens initialized: {len(new_tokens)} tokens, "
+            f"IDs {bpe_vocab_size}–{bpe_vocab_size + len(new_tokens) - 1}"
+        )
 
     def preprocess_text(self, raw_text: str, language_id: str = None, lowercase: bool = True, nfkd_normalize: bool = True):
         """
@@ -274,7 +297,7 @@ class MTLTokenizer:
             preprocessed_text = preprocessed_text.lower()
         if nfkd_normalize:
             preprocessed_text = normalize("NFKD", preprocessed_text)
-        
+
         return preprocessed_text
 
     def text_to_tokens(self, text: str, language_id: str = None, lowercase: bool = True, nfkd_normalize: bool = True):
@@ -282,9 +305,52 @@ class MTLTokenizer:
         text_tokens = torch.IntTensor(text_tokens).unsqueeze(0)
         return text_tokens
 
-    def encode(self, txt: str, language_id: str = None, lowercase: bool = True, nfkd_normalize: bool = True):
+    def encode_phonemes(self, text: str, language_id: str) -> list[int]:
+        """Encode text via espeak-ng phonemization → phoneme token IDs.
+
+        Bypasses BPE entirely. Used for EU languages when phoneme_mode=True.
+
+        Returns:
+            List of token IDs: [lang_token, PHON_marker, ph_token, ph_token, ...]
+        """
+        from chatterbox.phoneme_tokens import (
+            text_to_phonemes,
+            phonemes_to_token_ids,
+        )
+
+        self._init_phoneme_tokens()
+
+        # 1. Language token (still BPE — e.g. [it]=637)
+        lang_str = f"[{language_id.lower()}]"
+        lang_enc = self.tokenizer.encode(lang_str)
+        lang_ids = lang_enc.ids  # typically 1 token
+
+        # 2. Phonemize text via espeak-ng
+        ipa = text_to_phonemes(text, language_id)
+        if ipa is None:
+            # espeak-ng unavailable — fall back to BPE
+            logger.warning(f"Phonemization failed for [{language_id}], falling back to BPE")
+            return self.encode(text, language_id=language_id, _force_bpe=True)
+
+        # 3. Convert IPA → phoneme token IDs
+        phoneme_ids = phonemes_to_token_ids(ipa, self._phoneme_token_to_id)
+
+        # 4. Combine: [lang] + [PHON] + phoneme tokens
+        # (phonemes_to_token_ids already prepends [PHON])
+        return lang_ids + phoneme_ids
+
+    def encode(self, txt: str, language_id: str = None, lowercase: bool = True,
+               nfkd_normalize: bool = True, _force_bpe: bool = False):
         txt = self.preprocess_text(txt, language_id=language_id, lowercase=lowercase, nfkd_normalize=nfkd_normalize)
-        
+
+        # --- Phoneme mode for EU languages ---
+        if (self.phoneme_mode
+                and not _force_bpe
+                and language_id
+                and language_id.lower() in self.PHONEME_LANGUAGES):
+            return self.encode_phonemes(txt, language_id)
+
+        # --- Standard BPE path ---
         # Language-specific text processing
         if language_id == 'zh':
             txt = self.cangjie_converter(txt)
@@ -299,11 +365,15 @@ class MTLTokenizer:
         elif language_id in ('en', 'fr', 'de', 'es', 'pt', 'it'):
             from chatterbox.models.tokenizers.euro_text_normalizers import normalize_text_for_language
             txt = normalize_text_for_language(txt, language_id)
-        
+            # G2P dictionary lookup (conservative — only known terms)
+            from chatterbox.g2p import get_default_pipeline
+            g2p = get_default_pipeline()
+            txt = g2p.process(txt, language_id)
+
         # Prepend language token
         if language_id:
             txt = f"[{language_id.lower()}]{txt}"
-        
+
         txt = txt.replace(' ', SPACE)
         return self.tokenizer.encode(txt).ids
 
