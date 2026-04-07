@@ -407,6 +407,64 @@ class ChatterboxMultilingualTTS:
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
+    def generate_ssml(
+        self,
+        ssml_text: str,
+        language_id: str,
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+    ):
+        """Generate audio from SSML markup.
+
+        Parses SSML into segments, generates audio for each text segment
+        with per-segment prosody, and inserts silence for <break> tags.
+        Returns concatenated audio tensor.
+        """
+        import numpy as np
+        from .ssml import parse_ssml
+
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, "Call prepare_conditionals() first"
+
+        segments = parse_ssml(ssml_text, default_language=language_id)
+        audio_parts = []
+
+        for seg in segments:
+            if seg.is_break:
+                # Insert silence
+                n_samples = int(seg.break_duration_ms / 1000.0 * self.sr)
+                silence = torch.zeros(1, n_samples)
+                audio_parts.append(silence)
+                continue
+
+            if not seg.text.strip():
+                continue
+
+            seg_lang = seg.language_id or language_id
+            wav = self.generate(
+                text=seg.text,
+                language_id=seg_lang,
+                exaggeration=seg.exaggeration,
+                cfg_weight=seg.cfg_weight,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+            )
+            audio_parts.append(wav)
+
+        if not audio_parts:
+            return torch.zeros(1, 1)
+
+        return torch.cat(audio_parts, dim=-1)
+
     def generate(
         self,
         text,
@@ -419,6 +477,16 @@ class ChatterboxMultilingualTTS:
         min_p=0.05,
         top_p=1.0,
     ):
+        # Auto-detect SSML
+        from .ssml import is_ssml
+        if is_ssml(text):
+            return self.generate_ssml(
+                text, language_id, audio_prompt_path=audio_prompt_path,
+                exaggeration=exaggeration, cfg_weight=cfg_weight,
+                temperature=temperature, repetition_penalty=repetition_penalty,
+                min_p=min_p, top_p=top_p,
+            )
+
         # Validate language_id
         if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
             supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())

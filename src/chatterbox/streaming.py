@@ -362,6 +362,10 @@ class ChatterboxStreamingTTS:
     ) -> Generator[np.ndarray, None, None]:
         """Stream audio chunks as speech tokens are generated.
 
+        Supports SSML input: if the text contains SSML tags, it is automatically
+        parsed into segments. Each segment is generated with its own prosody
+        parameters, and <break> tags produce silence intervals.
+
         Args:
             sentence_pipelining: if True, split text into sentences and process
                 each independently through T3 while maintaining audio continuity.
@@ -371,6 +375,17 @@ class ChatterboxStreamingTTS:
             np.ndarray: audio chunk (1D float array at self.sample_rate Hz).
                         Chunks are NOT watermarked — call get_full_watermarked() after streaming.
         """
+        # --- Auto-detect SSML ---
+        from .ssml import is_ssml
+        if is_ssml(text):
+            yield from self._generate_stream_ssml(
+                text=text, audio_prompt_path=audio_prompt_path, language_id=language_id,
+                temperature=temperature, repetition_penalty=repetition_penalty,
+                min_p=min_p, top_p=top_p, cfg_weight=cfg_weight, exaggeration=exaggeration,
+                n_cfm_timesteps=n_cfm_timesteps,
+            )
+            return
+
         if sentence_pipelining:
             yield from self._generate_stream_pipelined(
                 text=text, audio_prompt_path=audio_prompt_path, language_id=language_id,
@@ -543,6 +558,144 @@ class ChatterboxStreamingTTS:
                     )
                     stream_state.cached_encoder_output = None
                     stream_state.cached_mel = None
+
+    def _generate_stream_ssml(
+        self,
+        text: str,
+        audio_prompt_path: Optional[str],
+        language_id: Optional[str],
+        temperature: float,
+        repetition_penalty: float,
+        min_p: float,
+        top_p: float,
+        cfg_weight: float,
+        exaggeration: float,
+        n_cfm_timesteps: Optional[int],
+    ) -> Generator[np.ndarray, None, None]:
+        """Process SSML markup: generate audio for text segments, silence for breaks.
+
+        Each text segment uses its own exaggeration/cfg_weight from SSML tags.
+        Audio continuity is maintained across segments via shared S3Gen state.
+        """
+        from .ssml import parse_ssml
+
+        self._all_chunks = []
+        self._cumulative_speech_s = 0.0
+        self._last_breath_time_s = -999.0
+        self._audio_emitted_s = 0.0
+        self._rms_sum_sq = 0.0
+        self._rms_n_samples = 0
+        self._crossfade_buffer = None
+        if self._resampler is not None:
+            self._resampler.reset()
+        device = self.model.device
+
+        if audio_prompt_path:
+            self.model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.model.conds is not None, "Call prepare_conditionals() first"
+
+        segments = parse_ssml(text, default_language=language_id)
+        logger.info(f"SSML: {len(segments)} segments")
+
+        # Shared S3Gen streaming state across all segments
+        stream_state = self.model.s3gen.init_streaming(ref_dict=self.model.conds.gen)
+
+        # Emit initial breath
+        initial_breath = self._get_initial_breath()
+        if initial_breath is not None:
+            yield initial_breath
+
+        for seg_idx, seg in enumerate(segments):
+            is_last = (seg_idx == len(segments) - 1)
+
+            # --- Break: emit silence ---
+            if seg.is_break:
+                silence = self._make_silence(seg.break_duration_ms)
+                if silence is not None and len(silence) > 0:
+                    self._all_chunks.append(silence)
+                    # Resample silence to output rate
+                    if self._resampler is not None:
+                        silence = self._resampler.process(silence, finalize=False)
+                    if len(silence) > 0:
+                        yield silence
+                continue
+
+            # --- Text segment ---
+            if not seg.text.strip():
+                continue
+
+            # Use segment-specific parameters from SSML tags
+            seg_lang = seg.language_id or language_id
+            seg_exag = seg.exaggeration
+            seg_cfg = seg.cfg_weight
+
+            # Update exaggeration if different from current
+            from .models.t3.modules.cond_enc import T3Cond
+            if float(seg_exag) != float(self.model.conds.t3.emotion_adv[0, 0, 0].item()):
+                _cond = self.model.conds.t3
+                self.model.conds.t3 = T3Cond(
+                    speaker_emb=_cond.speaker_emb,
+                    cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                    emotion_adv=seg_exag * torch.ones(1, 1, 1),
+                ).to(device=device)
+
+            # Tokenize segment text
+            text_tokens = self._tokenize_text(seg.text, seg_lang, device)
+
+            # Start T3 for this segment
+            token_gen = self._start_t3_stream(
+                text_tokens, seg_cfg, temperature,
+                repetition_penalty, min_p, top_p,
+            )
+
+            # Collect and emit tokens
+            segment_tokens = []
+            tokens_since_last_emit = 0
+            chunk_index = 0
+
+            for token in token_gen:
+                token_val = token.view(-1)
+                if token_val.item() < SPEECH_VOCAB_SIZE:
+                    segment_tokens.append(token_val)
+                tokens_since_last_emit += 1
+
+                threshold = self._get_chunk_threshold(chunk_index, stream_state.is_first_chunk)
+                if tokens_since_last_emit >= threshold and len(segment_tokens) > 0:
+                    audio_chunk = self._emit_chunk(
+                        segment_tokens, stream_state,
+                        finalize=False, n_cfm_timesteps=n_cfm_timesteps,
+                    )
+                    if audio_chunk is not None:
+                        yield audio_chunk
+                    tokens_since_last_emit = 0
+                    chunk_index += 1
+
+            # Finalize this segment
+            if len(segment_tokens) > 0:
+                audio_chunk = self._emit_chunk(
+                    segment_tokens, stream_state,
+                    finalize=is_last, n_cfm_timesteps=n_cfm_timesteps,
+                )
+                if audio_chunk is not None:
+                    yield audio_chunk
+
+            # Reset mel tracking for next segment (keep HiFiGAN cache)
+            if not is_last:
+                stream_state.prev_stable_mel_len = 0
+                if hasattr(stream_state, 'encoder_caches') and stream_state.encoder_caches is not None:
+                    stream_state.encoder_caches = self.model.s3gen.flow.encoder.init_caches(
+                        self.model.device, next(self.model.s3gen.parameters()).dtype
+                    )
+                    stream_state.cached_encoder_output = None
+                    stream_state.cached_mel = None
+
+    def _make_silence(self, duration_ms: float) -> Optional[np.ndarray]:
+        """Generate silence at native sample rate (24kHz)."""
+        if duration_ms <= 0:
+            return None
+        n_samples = int(duration_ms / 1000.0 * S3GEN_SR)
+        return np.zeros(n_samples, dtype=np.float32)
 
     def _get_chunk_threshold(self, chunk_index: int, is_first_chunk: bool) -> int:
         """Get token threshold for the current chunk.
