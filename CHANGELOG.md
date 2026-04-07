@@ -1,5 +1,89 @@
 # ChatterBox NG — Changelog
 
+## v0.4.0 — SSML, Dictionary API, Concurrent Requests, O(1) Streaming (2026-04-07)
+
+> SSML completo per telefonia, API custom dictionary, request isolation,
+> windowed CFM O(1), INT8 quantization. 107 test.
+
+### SSML Fully Functional
+
+- **`<say-as>`** ora normalizza direttamente via num2words:
+  - `interpret-as="date"` con attributo `format` (dmy/mdy/ymd): `15/03/2024` → "quindici marzo duemilaventiquattro"
+  - `interpret-as="currency"`: `€1250` → "milleduecentocinquanta euro"
+  - `interpret-as="number"`: `12345` → "dodicimilatrecentoquarantacinque"
+  - `interpret-as="ordinal"`: `5` → "quinto"
+  - `interpret-as="time"`: `14:30` → "quattordici e trenta"
+  - Tutte le 6 lingue EU (IT/EN/FR/DE/ES/PT) con nomi mesi e forme specifiche
+- **`<phoneme>`** ora funziona: IPA → respelling ortografico via tabelle G2P
+  - `<phoneme ph="ʃmɪt">Schmidt</phoneme>` → "scimit" (italiano)
+  - Fallback al testo originale se conversione fallisce
+- **`<emphasis>`**: `strong`=0.8, `moderate`=0.5, `reduced`=0.3 → exaggeration
+- **`<prosody rate>`**: `slow`/`fast`/percentuale → cfg_weight
+- **`<break>`**: silenzio in ms/s, `strength` attribute
+- **`<p>`, `<s>`**: auto-break 600ms/300ms
+- **Auto-detection**: nessun flag necessario, SSML rilevato automaticamente
+
+### Custom Dictionary REST API
+
+- `GET /api/dictionary` — lista entries (filtro per lingua)
+- `POST /api/dictionary` — add singolo, batch, o load YAML
+- `DELETE /api/dictionary` — rimuovi entry
+- `CustomDictionary.remove()` e `list_entries()` aggiunti
+- Flag CLI `--dict` per caricare YAML all'avvio
+
+### Concurrent Requests (Request Isolation)
+
+- **`asyncio.Lock`** serializza accesso GPU — FIFO, nessuna corruzione identità vocale
+- **Thread pool offload** — generatori sync in `run_in_executor()`, event loop mai bloccato
+- **Thread-safe model loading** — double-check locking su `_get_model()`
+- **Request stats** — active/queued/total requests nel `/health` endpoint
+
+### O(1) Windowed CFM Streaming
+
+- `streaming_step_efficient()` — primo chunk: full CFM (identità vocale), successivi: CFM solo su [context + new] frames
+- `decode_cfm_windowed()` — CFM UNet vede solo la finestra, non tutta la sequenza
+- `efficient_streaming=True` (default), `cfm_context_frames=30`
+- Costo per chunk costante indipendentemente dalla lunghezza totale
+
+### INT8 Weight-Only Quantization
+
+- `quantize_t3_int8(model)` — 3 backend (torchao → torch.ao → manual)
+- `Int8WeightLinear` — per-channel symmetric INT8 con dequant a inference
+- ~2x memory reduction su T3
+- Flag CLI `--int8` nel server
+
+### G2P Pipeline
+
+- `G2PPipeline` con espeak-ng per 6 lingue EU
+- `CustomDictionary` con priorità: dizionario > auto-respelling
+- `ipa_to_respelling()` standalone function per SSML phoneme
+- Tabelle IPA→ortografia per IT/EN/FR/DE/ES/PT
+- Dizionari YAML per telefonia inclusi (`dictionaries/`)
+
+### Phoneme Embeddings
+
+- Token phonemici per 6 lingue EU
+- Training LoRA T3 in corso (v4, MLS dataset)
+
+### Text Normalization (6 EU Languages)
+
+- IT/EN/FR/DE/ES/PT: numeri, date, orari, valute, ordinali, abbreviazioni, telefoni
+- `normalize_text_for_language(text, lang)` dispatcher
+
+### Benchmark Script
+
+- `benchmarks/bench_streaming.py` — A/B efficient vs full, 6 lingue, FCL/RTF/p95
+- Test sentences short/medium/long per lingua
+
+### Test Suite: 107 test
+
+- `test_ssml.py`: 42 test (SSML parsing, say-as normalization, phoneme IPA)
+- `test_g2p.py`: 34 test (dictionary CRUD, foreign detection, tokenizer)
+- `test_server_api.py`: 13 test (dictionary API, concurrency model, server structure)
+- `test_phoneme_embeddings.py`: 18 test
+
+---
+
 ## v0.3.0 — Production Real-Time Streaming on L4 (2026-04-04)
 
 > Ottimizzazione completa per telefonia italiana real-time su NVIDIA L4.
