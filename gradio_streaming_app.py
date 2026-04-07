@@ -26,17 +26,10 @@ def set_seed(seed: int):
     np.random.seed(seed)
 
 
-def load_model(model_type: str = "standard"):
-    """Load TTS model based on type."""
-    if model_type == "multilingual":
-        from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-        return ChatterboxMultilingualTTS.from_pretrained(DEVICE)
-    elif model_type == "turbo":
-        from chatterbox.tts_turbo import ChatterboxTurboTTS
-        return ChatterboxTurboTTS.from_pretrained(DEVICE)
-    else:
-        from chatterbox.tts import ChatterboxTTS
-        return ChatterboxTTS.from_pretrained(DEVICE)
+def load_model(model_type: str = "multilingual"):
+    """Load TTS model."""
+    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+    return ChatterboxMultilingualTTS.from_pretrained(DEVICE)
 
 
 def generate_streaming(

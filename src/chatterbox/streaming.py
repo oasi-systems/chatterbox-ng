@@ -30,7 +30,6 @@ from math import gcd
 
 from .models.s3tokenizer import drop_invalid_tokens, SPEECH_VOCAB_SIZE
 from .models.s3gen import S3GEN_SR
-from .models.t3.modules.cond_enc import T3Cond
 
 # Built-in breath templates directory
 _BREATH_TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), 'breath_templates')
@@ -113,10 +112,10 @@ class StreamingResampler:
 
 
 class ChatterboxStreamingTTS:
-    """Streaming wrapper for ChatterboxTTS or ChatterboxMultilingualTTS.
+    """Streaming wrapper for ChatterboxMultilingualTTS.
 
     Usage:
-        model = ChatterboxTTS.from_pretrained(device)
+        model = ChatterboxMultilingualTTS.from_pretrained(device)
         streamer = ChatterboxStreamingTTS(model)
 
         for audio_chunk in streamer.generate_stream("Hello world", audio_prompt_path="ref.wav"):
@@ -151,7 +150,7 @@ class ChatterboxStreamingTTS:
     ):
         """
         Args:
-            model: ChatterboxTTS, ChatterboxMultilingualTTS, or ChatterboxTurboTTS instance
+            model: ChatterboxMultilingualTTS instance
             chunk_tokens: number of speech tokens to buffer before emitting audio (~40ms per token)
             min_initial_tokens: minimum tokens before first audio emission (higher = better first-chunk quality)
             output_sample_rate: resample output to this rate. Default 16000 (telephony/Asterisk).
@@ -241,9 +240,6 @@ class ChatterboxStreamingTTS:
     def _is_multilingual(self):
         return hasattr(self.model, 'tokenizer') and hasattr(self.model.tokenizer, 'cangjie_converter')
 
-    def _is_turbo(self):
-        return hasattr(self.model, 't3') and self.model.t3.is_gpt
-
     def _load_breath_templates(self):
         """Lazy-load breath templates from the built-in directory."""
         if self._breath_templates_cache is not None:
@@ -329,32 +325,22 @@ class ChatterboxStreamingTTS:
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
         return text_tokens
 
-    def _start_t3_stream(self, text_tokens, is_turbo, cfg_weight, temperature,
-                         repetition_penalty, min_p, top_p, top_k):
+    def _start_t3_stream(self, text_tokens, cfg_weight, temperature,
+                         repetition_penalty, min_p, top_p):
         """Start T3 token generator for given text tokens."""
-        if not is_turbo and cfg_weight > 0.0:
+        if cfg_weight > 0.0:
             text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
 
-        if is_turbo:
-            return self.model.t3.inference_turbo_streaming(
-                t3_cond=self.model.conds.t3,
-                text_tokens=text_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-            )
-        else:
-            return self.model.t3.inference_streaming(
-                t3_cond=self.model.conds.t3,
-                text_tokens=text_tokens,
-                max_new_tokens=1000,
-                temperature=temperature,
-                cfg_weight=cfg_weight,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-            )
+        return self.model.t3.inference_streaming(
+            t3_cond=self.model.conds.t3,
+            text_tokens=text_tokens,
+            max_new_tokens=1000,
+            temperature=temperature,
+            cfg_weight=cfg_weight,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+            top_p=top_p,
+        )
 
     def generate_stream(
         self,
@@ -368,8 +354,6 @@ class ChatterboxStreamingTTS:
         top_p: float = 0.95,
         cfg_weight: float = 0.5,
         exaggeration: float = 0.7,
-        # Turbo-specific params
-        top_k: int = 1000,
         # S3Gen params
         n_cfm_timesteps: Optional[int] = None,
         # Pipelining splits text into sentences with independent T3 passes.
@@ -392,7 +376,7 @@ class ChatterboxStreamingTTS:
                 text=text, audio_prompt_path=audio_prompt_path, language_id=language_id,
                 temperature=temperature, repetition_penalty=repetition_penalty,
                 min_p=min_p, top_p=top_p, cfg_weight=cfg_weight, exaggeration=exaggeration,
-                top_k=top_k, n_cfm_timesteps=n_cfm_timesteps,
+                n_cfm_timesteps=n_cfm_timesteps,
             )
             return
 
@@ -406,7 +390,6 @@ class ChatterboxStreamingTTS:
         self._crossfade_buffer = None
         if self._resampler is not None:
             self._resampler.reset()
-        is_turbo = self._is_turbo()
         device = self.model.device
 
         # --- Prepare conditionals ---
@@ -429,8 +412,8 @@ class ChatterboxStreamingTTS:
 
         # --- Start T3 streaming ---
         token_gen = self._start_t3_stream(
-            text_tokens, is_turbo, cfg_weight, temperature,
-            repetition_penalty, min_p, top_p, top_k,
+            text_tokens, cfg_weight, temperature,
+            repetition_penalty, min_p, top_p,
         )
 
         # --- Stream tokens and emit audio chunks ---
@@ -468,7 +451,6 @@ class ChatterboxStreamingTTS:
         top_p: float,
         cfg_weight: float,
         exaggeration: float,
-        top_k: int,
         n_cfm_timesteps: Optional[int],
     ) -> Generator[np.ndarray, None, None]:
         """Sentence-level pipelining: process each sentence through T3 independently
@@ -489,7 +471,6 @@ class ChatterboxStreamingTTS:
         self._crossfade_buffer = None
         if self._resampler is not None:
             self._resampler.reset()
-        is_turbo = self._is_turbo()
         device = self.model.device
 
         if audio_prompt_path:
@@ -516,8 +497,8 @@ class ChatterboxStreamingTTS:
 
             # Start T3 for this sentence
             token_gen = self._start_t3_stream(
-                text_tokens, is_turbo, cfg_weight, temperature,
-                repetition_penalty, min_p, top_p, top_k,
+                text_tokens, cfg_weight, temperature,
+                repetition_penalty, min_p, top_p,
             )
 
             # Collect tokens for this sentence (fresh accumulation per sentence)

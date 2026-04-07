@@ -84,15 +84,8 @@ def create_app(model_type: str = "multilingual"):
         return _model["instance"]
 
     def _load_model(mtype, device):
-        if mtype == "multilingual":
-            from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-            return ChatterboxMultilingualTTS.from_pretrained(device)
-        elif mtype == "turbo":
-            from chatterbox.tts_turbo import ChatterboxTurboTTS
-            return ChatterboxTurboTTS.from_pretrained(device)
-        else:
-            from chatterbox.tts import ChatterboxTTS
-            return ChatterboxTTS.from_pretrained(device)
+        from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+        return ChatterboxMultilingualTTS.from_pretrained(device)
 
     def _prepare_prompt(audio_b64: Optional[str], model) -> Optional[str]:
         """Decode base64 audio prompt to temp file, return path."""

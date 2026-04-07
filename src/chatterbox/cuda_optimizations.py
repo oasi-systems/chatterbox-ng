@@ -39,7 +39,7 @@ def optimize_for_cuda(
     """Apply CUDA-specific optimizations to a ChatterBox model in-place.
 
     Args:
-        model: ChatterboxTTS, ChatterboxMultilingualTTS, or ChatterboxTurboTTS
+        model: ChatterboxMultilingualTTS instance
         compile_mode: torch.compile mode. Default: "default" (kernel fusion without
             CUDA graphs — safe for streaming with dynamic shapes).
             "max-autotune" uses CUDA graphs and is INCOMPATIBLE with streaming
