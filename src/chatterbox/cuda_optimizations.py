@@ -35,6 +35,7 @@ def optimize_for_cuda(
     compile_models: bool = True,
     use_tensorrt: bool = False,
     trt_engine_dir: str = None,
+    use_int8: bool = False,
 ):
     """Apply CUDA-specific optimizations to a ChatterBox model in-place.
 
@@ -86,6 +87,12 @@ def optimize_for_cuda(
             if trt_result.get("hifigan"):
                 compile_models = False  # TRT handles these, skip compile
                 logger.info("Skipping torch.compile for TRT-accelerated modules")
+
+    # --- INT8 weight quantization for T3 ---
+    if use_int8:
+        from .int8_quantization import quantize_t3_int8
+        int8_result = quantize_t3_int8(model)
+        logger.info(f"INT8 quantization: {int8_result}")
 
     # --- torch.compile ---
     if compile_models:

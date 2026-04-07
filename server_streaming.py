@@ -85,7 +85,11 @@ def create_app(model_type: str = "multilingual"):
 
     def _load_model(mtype, device):
         from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-        return ChatterboxMultilingualTTS.from_pretrained(device)
+        from chatterbox.cuda_optimizations import optimize_for_cuda
+        model = ChatterboxMultilingualTTS.from_pretrained(device)
+        if device == "cuda" or (isinstance(device, str) and "cuda" in device):
+            optimize_for_cuda(model, compile_mode="default", use_bf16=True)
+        return model
 
     def _prepare_prompt(audio_b64: Optional[str], model) -> Optional[str]:
         """Decode base64 audio prompt to temp file, return path."""
@@ -98,7 +102,11 @@ def create_app(model_type: str = "multilingual"):
         return tmp.name
 
     def _generate_chunks(params: dict):
-        """Generator that yields audio chunks as bytes."""
+        """Generator that yields audio chunks as bytes.
+
+        Supports SSML: if text contains <speak> or SSML tags, auto-detection
+        in generate_stream() handles per-segment prosody, emphasis, breaks.
+        """
         from chatterbox.streaming import ChatterboxStreamingTTS
 
         model = _get_model()
@@ -107,6 +115,9 @@ def create_app(model_type: str = "multilingual"):
         streamer = ChatterboxStreamingTTS(
             model,
             chunk_tokens=params.get("chunk_tokens", 25),
+            output_sample_rate=params.get("output_sample_rate", 16000),
+            efficient_streaming=params.get("efficient_streaming", True),
+            cfm_context_frames=params.get("cfm_context_frames", 30),
         )
 
         gen_kwargs = {
@@ -211,6 +222,11 @@ def create_app(model_type: str = "multilingual"):
             "model_type": model_type,
             "model_loaded": _model["instance"] is not None,
             "sample_rate": SAMPLE_RATE,
+            "features": {
+                "ssml": True,
+                "efficient_streaming": True,
+                "languages": ["it", "en", "fr", "de", "es", "pt"],
+            },
         })
 
     app = Starlette(
@@ -232,6 +248,7 @@ def main():
                         choices=["standard", "multilingual", "turbo"],
                         help="Model type to load")
     parser.add_argument("--preload", action="store_true", help="Preload model on startup")
+    parser.add_argument("--int8", action="store_true", help="Enable INT8 quantization for T3")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -241,7 +258,11 @@ def main():
     app, model_loader = create_app(args.model)
     if args.preload:
         logger.info("Preloading model...")
-        model_loader()
+        model = model_loader()
+        if args.int8 and model is not None:
+            from chatterbox.int8_quantization import quantize_t3_int8
+            result = quantize_t3_int8(model)
+            logger.info(f"INT8 quantization: {result}")
         logger.info("Model loaded.")
 
     try:
