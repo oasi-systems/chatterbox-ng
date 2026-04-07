@@ -174,28 +174,53 @@ def create_app(model_type: str = "multilingual"):
             yield chunk
 
     async def _generate_chunks_async(params: dict):
-        """Async generator: serializes GPU access, runs inference in thread pool.
+        """Async generator: serializes GPU access, streams chunks via queue.
 
         Flow:
         1. Acquire inference lock (queued requests wait here)
-        2. Run sync generator in thread pool via asyncio
-        3. Yield chunks back to the async caller
+        2. Spawn sync generator in thread — pushes chunks to queue
+        3. Async loop reads queue and yields chunks immediately (true streaming)
         4. Release lock when done
+
+        This ensures TTFA = time to first chunk, NOT time to generate all audio.
         """
+        import queue as queue_mod
+
         _request_stats["queued"] += 1
         async with _inference_lock:
             _request_stats["queued"] -= 1
             _request_stats["active"] += 1
             _request_stats["total"] += 1
             try:
+                chunk_queue = queue_mod.Queue()
+                _SENTINEL = object()
+
+                def _producer():
+                    try:
+                        for chunk in _generate_chunks_sync(params):
+                            chunk_queue.put(chunk)
+                    except Exception as e:
+                        chunk_queue.put(e)
+                    finally:
+                        chunk_queue.put(_SENTINEL)
+
                 loop = asyncio.get_event_loop()
-                # Collect chunks from sync generator in thread pool.
-                # We run the FULL generation in a thread to avoid blocking the event loop.
-                chunks = await loop.run_in_executor(
-                    None, lambda: list(_generate_chunks_sync(params))
-                )
-                for chunk in chunks:
-                    yield chunk
+                loop.run_in_executor(None, _producer)
+
+                while True:
+                    # Poll queue without blocking the event loop
+                    while True:
+                        try:
+                            item = chunk_queue.get_nowait()
+                            break
+                        except queue_mod.Empty:
+                            await asyncio.sleep(0.01)
+
+                    if item is _SENTINEL:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
             finally:
                 _request_stats["active"] -= 1
 
@@ -431,9 +456,17 @@ def main():
         logger.info("Preloading model...")
         model = model_loader()
         if args.int8 and model is not None:
-            from chatterbox.int8_quantization import quantize_t3_int8
-            result = quantize_t3_int8(model)
-            logger.info(f"INT8 quantization: {result}")
+            logger.warning(
+                "INT8 quantization is currently disabled: torch.ao dynamic INT8 "
+                "only supports CPU, not CUDA. Use --no-int8 or remove --int8 flag. "
+                "Future: GPTQ/AWQ for CUDA-native quantization."
+            )
+            # from chatterbox.int8_quantization import quantize_t3_int8
+            # result = quantize_t3_int8(model)
+            # NOTE: quantize_t3_int8 also breaks T3.device property
+            # (nn.Module wrapping removes the @property accessor).
+            # If re-enabling, must monkey-patch: type(model.t3).device = property(...)
+
         logger.info("Model loaded.")
 
     try:
