@@ -489,6 +489,41 @@ class CustomDictionary:
         else:
             self._global[word.lower()] = respelling
 
+    def remove(self, word: str, language_id: str = None) -> bool:
+        """Remove a dictionary entry. Returns True if entry existed."""
+        w = word.lower()
+        if language_id:
+            if language_id in self._entries and w in self._entries[language_id]:
+                del self._entries[language_id][w]
+                return True
+        else:
+            if w in self._global:
+                del self._global[w]
+                return True
+        return False
+
+    def list_entries(self, language_id: str = None) -> dict:
+        """List dictionary entries.
+
+        Args:
+            language_id: if set, return entries for that language + globals.
+                         If None, return all entries grouped by language.
+
+        Returns:
+            dict with "global" and/or language keys mapping to {word: respelling}.
+        """
+        if language_id:
+            result = {}
+            if language_id in self._entries:
+                result[language_id] = dict(self._entries[language_id])
+            result["global"] = dict(self._global)
+            return result
+        # All entries
+        result = {"global": dict(self._global)}
+        for lang, entries in self._entries.items():
+            result[lang] = dict(entries)
+        return result
+
     def lookup(self, word: str, language_id: str) -> Optional[str]:
         """Look up a word. Returns respelling or None."""
         w = word.lower()
@@ -757,3 +792,19 @@ def process_text(text: str, lang: str, dictionary: CustomDictionary = None) -> s
         pipeline = G2PPipeline(custom_dict=dictionary)
         return pipeline.process(text, lang)
     return get_default_pipeline().process(text, lang)
+
+
+def ipa_to_respelling(ipa: str, target_lang: str) -> str:
+    """Convert IPA string to target language orthography (standalone function).
+
+    Used by SSML <phoneme> tag to convert IPA pronunciation overrides
+    to orthographic respellings the BPE tokenizer can handle.
+
+    Args:
+        ipa: IPA transcription (e.g., "ˈʃmɪt" for "Schmidt")
+        target_lang: target language code (it, fr, de, es, pt, en)
+
+    Returns:
+        Orthographic respelling (e.g., "shmit" for Italian)
+    """
+    return get_default_pipeline()._ipa_to_respelling(ipa, target_lang)

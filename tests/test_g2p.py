@@ -95,6 +95,46 @@ class TestCustomDictionary:
         d = CustomDictionary()
         assert d.lookup("nonexistent", "it") is None
 
+    def test_remove_language_specific(self):
+        d = CustomDictionary()
+        d.add("test", "tèst", language_id="it")
+        assert d.remove("test", language_id="it") is True
+        assert d.lookup("test", "it") is None
+
+    def test_remove_global(self):
+        d = CustomDictionary()
+        d.add("IBAN", "i ban")
+        assert d.remove("IBAN") is True
+        assert d.lookup("IBAN", "it") is None
+
+    def test_remove_nonexistent(self):
+        d = CustomDictionary()
+        assert d.remove("ghost", language_id="it") is False
+        assert d.remove("ghost") is False
+
+    def test_list_entries_all(self):
+        d = CustomDictionary()
+        d.add("IBAN", "i ban")
+        d.add("Schmidt", "shmit", language_id="it")
+        d.add("Müller", "miuller", language_id="de")
+        result = d.list_entries()
+        assert "global" in result
+        assert result["global"]["iban"] == "i ban"
+        assert result["it"]["schmidt"] == "shmit"
+        assert result["de"]["müller"] == "miuller"
+
+    def test_list_entries_by_language(self):
+        d = CustomDictionary()
+        d.add("IBAN", "i ban")
+        d.add("Schmidt", "shmit", language_id="it")
+        result = d.list_entries(language_id="it")
+        assert "it" in result
+        assert "global" in result
+        assert result["it"]["schmidt"] == "shmit"
+        assert result["global"]["iban"] == "i ban"
+        # German shouldn't be present
+        assert "de" not in result
+
 
 # ============================================================================
 # Foreign Word Detection tests

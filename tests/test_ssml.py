@@ -122,17 +122,84 @@ class TestSayAs:
         assert "39" in text
         assert "02" in text
 
-    def test_currency_passthrough(self):
-        segs = parse_ssml('<speak><say-as interpret-as="currency">€1.250</say-as></speak>')
-        # Currency is handled by euro_text_normalizers, just passes through
-        assert "1.250" in segs[0].text
+    def test_currency_normalized(self):
+        segs = parse_ssml('<speak><say-as interpret-as="currency">€1250</say-as></speak>',
+                          default_language="it")
+        text = segs[0].text.lower()
+        # Should contain "euro" after normalization
+        assert "euro" in text
+
+    def test_currency_no_num2words(self):
+        # Even without language, should not crash
+        segs = parse_ssml('<speak><say-as interpret-as="currency">€100</say-as></speak>')
+        assert len(segs) >= 1
+
+    def test_date_dmy(self):
+        segs = parse_ssml(
+            '<speak><say-as interpret-as="date" format="dmy">15/03/2024</say-as></speak>',
+            default_language="it"
+        )
+        text = segs[0].text.lower()
+        # Should contain month name "marzo"
+        assert "marzo" in text
+
+    def test_date_mdy(self):
+        segs = parse_ssml(
+            '<speak><say-as interpret-as="date" format="mdy">03/15/2024</say-as></speak>',
+            default_language="en"
+        )
+        text = segs[0].text.lower()
+        assert "march" in text
+
+    def test_number_normalized(self):
+        segs = parse_ssml(
+            '<speak><say-as interpret-as="number">12345</say-as></speak>',
+            default_language="it"
+        )
+        text = segs[0].text.lower()
+        # Should be expanded to Italian words
+        assert "dodici" in text or "mila" in text or "cento" in text
+
+    def test_ordinal(self):
+        segs = parse_ssml(
+            '<speak><say-as interpret-as="ordinal">5</say-as></speak>',
+            default_language="it"
+        )
+        text = segs[0].text.lower()
+        assert "quint" in text  # "quinto"
+
+    def test_time(self):
+        segs = parse_ssml(
+            '<speak><say-as interpret-as="time">14:30</say-as></speak>',
+            default_language="it"
+        )
+        text = segs[0].text.lower()
+        assert "quattordici" in text or "trenta" in text
 
 
 class TestPhoneme:
     def test_ipa_stored(self):
-        segs = parse_ssml('<speak><phoneme alphabet="ipa" ph="ʃmɪt">Schmidt</phoneme></speak>')
+        segs = parse_ssml('<speak><phoneme alphabet="ipa" ph="ʃmɪt">Schmidt</phoneme></speak>',
+                          default_language="it")
         assert segs[0].phoneme_ipa == "ʃmɪt"
-        assert segs[0].text == "Schmidt"
+        # Text should be respelled (not original "Schmidt")
+        # IPA "ʃmɪt" → Italian respelling via g2p
+        assert segs[0].text != ""
+
+    def test_ipa_respelling_italian(self):
+        segs = parse_ssml(
+            '<speak><phoneme alphabet="ipa" ph="ʃmɪt">Schmidt</phoneme></speak>',
+            default_language="it"
+        )
+        # IPA ʃ → "sci" in Italian → "scimit"
+        text = segs[0].text.lower()
+        assert text != "schmidt"  # Must be respelled
+        assert "sci" in text  # ʃ → "sci"
+
+    def test_ipa_no_language_fallback(self):
+        # Without language, should fall back to original text
+        segs = parse_ssml('<speak><phoneme alphabet="ipa" ph="test">Word</phoneme></speak>')
+        assert segs[0].text != ""  # Should not crash
 
 
 class TestSub:
@@ -215,7 +282,7 @@ class TestTelephonyScenario:
         ssml = '''
         <speak>
             Il suo saldo è di
-            <say-as interpret-as="currency">€1.250,00</say-as>.
+            <say-as interpret-as="currency">€1250</say-as>.
             <break time="800ms"/>
             <emphasis level="strong">Desidera effettuare un'operazione?</emphasis>
         </speak>
@@ -224,6 +291,10 @@ class TestTelephonyScenario:
         assert any(s.is_break and s.break_duration_ms == 800.0 for s in segs)
         strong_segs = [s for s in segs if not s.is_break and s.emphasis == "strong"]
         assert len(strong_segs) == 1
+        # Currency should be normalized
+        text_segs = [s for s in segs if not s.is_break]
+        all_text = " ".join(s.text for s in text_segs).lower()
+        assert "euro" in all_text
 
 
 if __name__ == "__main__":

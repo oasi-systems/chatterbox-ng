@@ -49,6 +49,33 @@ from xml.etree import ElementTree as ET
 logger = logging.getLogger(__name__)
 
 
+def _ipa_to_respelling_safe(ipa: str, lang: str) -> str:
+    """Convert IPA to respelling, with robust import fallback.
+
+    Tries multiple import paths so this works both as a package import
+    and when ssml.py is loaded standalone for testing.
+    """
+    try:
+        try:
+            from .g2p import ipa_to_respelling
+        except (ImportError, SystemError):
+            # Standalone loading or package not fully available
+            import importlib.util
+            import os
+            g2p_path = os.path.join(os.path.dirname(__file__), "g2p.py")
+            if os.path.exists(g2p_path):
+                spec = importlib.util.spec_from_file_location("_g2p_standalone", g2p_path)
+                g2p_mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(g2p_mod)
+                ipa_to_respelling = g2p_mod.ipa_to_respelling
+            else:
+                return ""
+        result = ipa_to_respelling(ipa, lang)
+        return result if result and result.strip() else ""
+    except Exception:
+        return ""
+
+
 # ============================================================================
 # Data Structures
 # ============================================================================
@@ -195,8 +222,9 @@ class SSMLParser:
         # --- <say-as> ---
         if tag == "say-as":
             interpret_as = element.get("interpret-as", "")
+            format_attr = element.get("format", None)
             inner_text = self._get_all_text(element)
-            converted = self._apply_say_as(inner_text, interpret_as, lang)
+            converted = self._apply_say_as(inner_text, interpret_as, lang, format_attr)
             segments.append(SSMLSegment(
                 text=converted,
                 language_id=lang,
@@ -217,8 +245,12 @@ class SSMLParser:
         if tag == "phoneme":
             ph = element.get("ph", "")
             inner_text = self._get_all_text(element)
+            # Convert IPA to orthographic respelling for the BPE tokenizer
+            respelled = inner_text
+            if ph and lang:
+                respelled = _ipa_to_respelling_safe(ph, lang) or inner_text
             segments.append(SSMLSegment(
-                text=inner_text,
+                text=respelled,
                 language_id=lang,
                 rate=rate,
                 emphasis=emphasis,
@@ -393,24 +425,231 @@ class SSMLParser:
             return 1.0
 
     @staticmethod
-    def _apply_say_as(text: str, interpret_as: str, lang: str) -> str:
-        """Apply say-as interpretation.
+    def _apply_say_as(text: str, interpret_as: str, lang: str,
+                      format_attr: str = None) -> str:
+        """Apply say-as interpretation with explicit normalization.
 
-        Note: most conversions are handled by euro_text_normalizers.
-        This handles only character-by-character spelling and explicit formats.
+        Converts structured data (dates, numbers, currency) to spoken form
+        using the euro_text_normalizers, rather than hoping the general
+        normalizer catches the pattern downstream.
         """
-        if interpret_as == "characters" or interpret_as == "spell-out":
-            # Spell out each character: "ABC" → "a, bi, ci" (in Italian)
+        if interpret_as in ("characters", "spell-out"):
             return " ".join(text)
 
         if interpret_as == "telephone":
-            # Read digits individually with pauses
             digits = re.sub(r'[^\d+]', ' ', text)
             return " ".join(digits.split())
 
-        # date, number, currency, ordinal → handled by euro_text_normalizers
-        # Just return the text and let the normalizer do its job
+        if interpret_as == "date":
+            return SSMLParser._normalize_date(text, lang, format_attr)
+
+        if interpret_as == "number":
+            return SSMLParser._normalize_number(text, lang)
+
+        if interpret_as == "currency":
+            return SSMLParser._normalize_currency(text, lang)
+
+        if interpret_as == "ordinal":
+            return SSMLParser._normalize_ordinal(text, lang)
+
+        if interpret_as == "time":
+            return SSMLParser._normalize_time(text, lang)
+
+        # Unknown interpret-as → pass through to general normalizer
         return text
+
+    @staticmethod
+    def _normalize_date(text: str, lang: str, format_attr: str = None) -> str:
+        """Convert date string to spoken form.
+
+        Supports format attribute: "dmy" (default EU), "mdy" (US), "ymd" (ISO).
+        """
+        try:
+            from num2words import num2words
+        except ImportError:
+            return text
+
+        # Extract digits from date
+        parts = re.split(r'[/\-.]', text.strip())
+        if len(parts) < 2:
+            return text
+
+        fmt = (format_attr or "dmy").lower()
+        try:
+            if fmt == "mdy":
+                month, day = int(parts[0]), int(parts[1])
+                year = int(parts[2]) if len(parts) > 2 else None
+            elif fmt == "ymd":
+                year = int(parts[0])
+                month, day = int(parts[1]), int(parts[2]) if len(parts) > 2 else (int(parts[1]), 1)
+            else:  # dmy (default for EU)
+                day, month = int(parts[0]), int(parts[1])
+                year = int(parts[2]) if len(parts) > 2 else None
+        except (ValueError, IndexError):
+            return text
+
+        # Language-specific month names
+        _MONTHS = {
+            "it": {1: "gennaio", 2: "febbraio", 3: "marzo", 4: "aprile", 5: "maggio",
+                   6: "giugno", 7: "luglio", 8: "agosto", 9: "settembre", 10: "ottobre",
+                   11: "novembre", 12: "dicembre"},
+            "fr": {1: "janvier", 2: "février", 3: "mars", 4: "avril", 5: "mai",
+                   6: "juin", 7: "juillet", 8: "août", 9: "septembre", 10: "octobre",
+                   11: "novembre", 12: "décembre"},
+            "de": {1: "Januar", 2: "Februar", 3: "März", 4: "April", 5: "Mai",
+                   6: "Juni", 7: "Juli", 8: "August", 9: "September", 10: "Oktober",
+                   11: "November", 12: "Dezember"},
+            "es": {1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo",
+                   6: "junio", 7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre",
+                   11: "noviembre", 12: "diciembre"},
+            "pt": {1: "janeiro", 2: "fevereiro", 3: "março", 4: "abril", 5: "maio",
+                   6: "junho", 7: "julho", 8: "agosto", 9: "setembro", 10: "outubro",
+                   11: "novembro", 12: "dezembro"},
+            "en": {1: "January", 2: "February", 3: "March", 4: "April", 5: "May",
+                   6: "June", 7: "July", 8: "August", 9: "September", 10: "October",
+                   11: "November", 12: "December"},
+        }
+
+        num2words_lang = lang if lang in ("it", "fr", "de", "es", "pt", "en") else "en"
+        month_name = _MONTHS.get(lang, _MONTHS["en"]).get(month, str(month))
+
+        try:
+            if lang == "it":
+                day_w = "primo" if day == 1 else num2words(day, lang="it")
+            elif lang == "fr":
+                day_w = "premier" if day == 1 else num2words(day, lang="fr")
+            elif lang == "de":
+                day_w = num2words(day, to="ordinal", lang="de")
+            elif lang == "en":
+                day_w = num2words(day, to="ordinal", lang="en")
+            else:
+                day_w = num2words(day, lang=num2words_lang)
+
+            if year:
+                year_w = num2words(year, lang=num2words_lang)
+                return f"{day_w} {month_name} {year_w}"
+            return f"{day_w} {month_name}"
+        except Exception:
+            return text
+
+    @staticmethod
+    def _normalize_number(text: str, lang: str) -> str:
+        """Convert number to spoken form."""
+        try:
+            from num2words import num2words
+        except ImportError:
+            return text
+
+        num2words_lang = lang if lang in ("it", "fr", "de", "es", "pt", "en") else "en"
+        clean = text.strip().replace(" ", "")
+
+        # Handle decimal separator (comma for EU, dot for EN)
+        if "," in clean and lang != "en":
+            parts = clean.split(",", 1)
+            try:
+                int_part = num2words(int(parts[0].replace(".", "")), lang=num2words_lang)
+                dec_part = num2words(int(parts[1]), lang=num2words_lang)
+                sep_word = {"it": "virgola", "fr": "virgule", "de": "Komma",
+                            "es": "coma", "pt": "vírgula"}.get(lang, "point")
+                return f"{int_part} {sep_word} {dec_part}"
+            except (ValueError, Exception):
+                pass
+
+        # Remove thousands separators
+        clean = clean.replace(".", "").replace(",", "")
+        try:
+            return num2words(int(clean), lang=num2words_lang)
+        except (ValueError, Exception):
+            return text
+
+    @staticmethod
+    def _normalize_currency(text: str, lang: str) -> str:
+        """Convert currency to spoken form (e.g., '€1.250' → 'milleduecentocinquanta euro')."""
+        try:
+            from num2words import num2words
+        except ImportError:
+            return text
+
+        num2words_lang = lang if lang in ("it", "fr", "de", "es", "pt", "en") else "en"
+
+        # Extract symbol and amount
+        m = re.match(r'([€$£])\s*([\d.,]+)', text.strip())
+        if not m:
+            m = re.match(r'([\d.,]+)\s*([€$£])', text.strip())
+            if not m:
+                return text
+            amount_str, symbol = m.group(1), m.group(2)
+        else:
+            symbol, amount_str = m.group(1), m.group(2)
+
+        # Clean amount: remove thousands separator
+        if lang == "en":
+            amount_str = amount_str.replace(",", "")
+        else:
+            amount_str = amount_str.replace(".", "").replace(",", ".")
+
+        _CURRENCY_NAMES = {
+            "€": {"it": ("euro", "euro"), "fr": ("euro", "euros"), "de": ("Euro", "Euro"),
+                   "es": ("euro", "euros"), "pt": ("euro", "euros"), "en": ("euro", "euros")},
+            "$": {"it": ("dollaro", "dollari"), "fr": ("dollar", "dollars"), "de": ("Dollar", "Dollar"),
+                   "es": ("dólar", "dólares"), "pt": ("dólar", "dólares"), "en": ("dollar", "dollars")},
+            "£": {"it": ("sterlina", "sterline"), "fr": ("livre", "livres"), "de": ("Pfund", "Pfund"),
+                   "es": ("libra", "libras"), "pt": ("libra", "libras"), "en": ("pound", "pounds")},
+        }
+
+        try:
+            amount = int(float(amount_str))
+            words = num2words(amount, lang=num2words_lang)
+            if amount == 1 and lang == "it":
+                words = "un"
+            names = _CURRENCY_NAMES.get(symbol, {}).get(lang, (symbol, symbol))
+            name = names[0] if amount == 1 else names[1]
+            return f"{words} {name}"
+        except (ValueError, Exception):
+            return text
+
+    @staticmethod
+    def _normalize_ordinal(text: str, lang: str) -> str:
+        """Convert ordinal number to spoken form."""
+        try:
+            from num2words import num2words
+        except ImportError:
+            return text
+
+        num2words_lang = lang if lang in ("it", "fr", "de", "es", "pt", "en") else "en"
+        clean = re.sub(r'[°ºªa]', '', text.strip())
+        try:
+            n = int(clean)
+            return num2words(n, to="ordinal", lang=num2words_lang)
+        except (ValueError, Exception):
+            return text
+
+    @staticmethod
+    def _normalize_time(text: str, lang: str) -> str:
+        """Convert time to spoken form (e.g., '14:30' → 'quattordici e trenta')."""
+        try:
+            from num2words import num2words
+        except ImportError:
+            return text
+
+        num2words_lang = lang if lang in ("it", "fr", "de", "es", "pt", "en") else "en"
+        m = re.match(r'(\d{1,2})[:.hH](\d{2})', text.strip())
+        if not m:
+            return text
+
+        h, mins = int(m.group(1)), int(m.group(2))
+        try:
+            h_w = num2words(h, lang=num2words_lang)
+            if mins == 0:
+                return h_w
+            m_w = num2words(mins, lang=num2words_lang)
+            sep = {"it": "e", "fr": "heures", "de": "Uhr", "es": "y",
+                   "pt": "e", "en": ""}.get(lang, "")
+            if sep:
+                return f"{h_w} {sep} {m_w}"
+            return f"{h_w} {m_w}"
+        except Exception:
+            return text
 
     @staticmethod
     def _merge_segments(segments: list[SSMLSegment]) -> list[SSMLSegment]:
