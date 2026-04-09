@@ -205,7 +205,7 @@ class ChatterboxStreamingTTS:
         self._all_chunks = []
         if self._resampler is not None:
             self._resampler.reset()
-        self._watermarker = perth.PerthImplicitWatermarker()
+        self._watermarker = None  # lazy init — only created when get_full_watermarked() is called
 
         # Humanizer setup
         if humanizer is not None:
@@ -358,7 +358,7 @@ class ChatterboxStreamingTTS:
         repetition_penalty: float = 1.2,
         min_p: float = 0.05,
         top_p: float = 0.95,
-        cfg_weight: float = 0.5,
+        cfg_weight: float = 0.0,
         exaggeration: float = 0.7,
         # S3Gen params
         n_cfm_timesteps: Optional[int] = None,
@@ -935,6 +935,8 @@ class ChatterboxStreamingTTS:
         full_audio_24k = np.concatenate(self._all_chunks, axis=0)
 
         # Watermark at native sample rate (24kHz)
+        if self._watermarker is None:
+            self._watermarker = perth.PerthImplicitWatermarker()
         watermarked_24k = self._watermarker.apply_watermark(full_audio_24k, sample_rate=S3GEN_SR)
 
         # Resample to output rate if needed

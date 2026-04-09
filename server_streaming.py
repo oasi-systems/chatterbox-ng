@@ -138,18 +138,34 @@ def create_app(model_type: str = "multilingual"):
         tmp.close()
         return tmp.name
 
+    # --- Reusable streamer (avoid PerthNet reload + re-init per request) ---
+    _streamer_cache = {"instance": None, "key": None}
+
+    def _get_streamer(model, chunk_tokens, output_sample_rate, efficient_streaming, cfm_context_frames):
+        """Get or create a ChatterboxStreamingTTS, reusing if config matches."""
+        from chatterbox.streaming import ChatterboxStreamingTTS
+        key = (id(model), chunk_tokens, output_sample_rate, efficient_streaming, cfm_context_frames)
+        if _streamer_cache["key"] != key:
+            _streamer_cache["instance"] = ChatterboxStreamingTTS(
+                model,
+                chunk_tokens=chunk_tokens,
+                output_sample_rate=output_sample_rate,
+                efficient_streaming=efficient_streaming,
+                cfm_context_frames=cfm_context_frames,
+            )
+            _streamer_cache["key"] = key
+        return _streamer_cache["instance"]
+
     def _generate_chunks_sync(params: dict):
         """Sync generator that yields audio chunks. Runs in thread pool.
 
         Supports SSML: if text contains <speak> or SSML tags, auto-detection
         in generate_stream() handles per-segment prosody, emphasis, breaks.
         """
-        from chatterbox.streaming import ChatterboxStreamingTTS
-
         model = _get_model()
         prompt_path = _prepare_prompt(params.get("audio_prompt_b64"))
 
-        streamer = ChatterboxStreamingTTS(
+        streamer = _get_streamer(
             model,
             chunk_tokens=params.get("chunk_tokens", 25),
             output_sample_rate=params.get("output_sample_rate", 16000),
@@ -162,7 +178,7 @@ def create_app(model_type: str = "multilingual"):
             "temperature": params.get("temperature", 0.8),
             "repetition_penalty": params.get("repetition_penalty", 1.2),
             "exaggeration": params.get("exaggeration", 0.5),
-            "cfg_weight": params.get("cfg_weight", 0.5),
+            "cfg_weight": params.get("cfg_weight", 0.0),
             "sentence_pipelining": params.get("sentence_pipelining", True),
         }
         if prompt_path:

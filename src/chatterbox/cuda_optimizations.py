@@ -59,6 +59,9 @@ def optimize_for_cuda(
         logger.warning("CUDA not available, skipping optimizations")
         return model
 
+    # --- Increase torch.compile cache to avoid recompilation on shape changes ---
+    torch._dynamo.config.cache_size_limit = 32
+
     # --- CUDA backend flags ---
     _set_cuda_flags()
 
