@@ -33,9 +33,6 @@ def optimize_for_cuda(
     compile_mode: str = "default",
     use_bf16: bool = True,
     compile_models: bool = True,
-    use_tensorrt: bool = False,
-    trt_engine_dir: str = None,
-    use_int8: bool = False,
 ):
     """Apply CUDA-specific optimizations to a ChatterBox model in-place.
 
@@ -47,8 +44,6 @@ def optimize_for_cuda(
             (crashes on dynamic tensor shapes). Only use for monolithic generate().
         use_bf16: convert to bfloat16 for 2x memory bandwidth
         compile_models: apply torch.compile to sub-modules
-        use_tensorrt: replace HiFiGAN and CFM estimator with TRT/ORT engines
-        trt_engine_dir: directory containing exported .onnx/.trt files (required if use_tensorrt=True)
 
     Returns:
         The same model, optimized.
@@ -74,25 +69,6 @@ def optimize_for_cuda(
     elif use_bf16:
         logger.info("BF16 not supported, enabling autocast (float16)...")
         _setup_autocast(model, torch.float16)
-
-    # --- TensorRT / ONNX Runtime acceleration ---
-    if use_tensorrt:
-        if not trt_engine_dir:
-            logger.warning("use_tensorrt=True but no trt_engine_dir specified, skipping")
-        else:
-            from .trt_runtime import load_trt_modules
-            trt_result = load_trt_modules(model, trt_engine_dir)
-            logger.info(f"TensorRT modules: {trt_result}")
-            # Don't torch.compile modules that are already using TRT
-            if trt_result.get("hifigan"):
-                compile_models = False  # TRT handles these, skip compile
-                logger.info("Skipping torch.compile for TRT-accelerated modules")
-
-    # --- INT8 weight quantization for T3 ---
-    if use_int8:
-        from .int8_quantization import quantize_t3_int8
-        int8_result = quantize_t3_int8(model)
-        logger.info(f"INT8 quantization: {int8_result}")
 
     # --- torch.compile ---
     if compile_models:

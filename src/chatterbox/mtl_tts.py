@@ -144,93 +144,6 @@ class Conditionals:
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
 
-def _load_bpe_vocab(ckpt_dir: Path = None) -> dict:
-    """Load BPE vocab dict {token_str: token_id} from tokenizer JSON.
-
-    Searches: ckpt_dir, package dir, HF cache.
-    """
-    import json
-    import glob
-
-    candidates = []
-    if ckpt_dir:
-        candidates.append(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json")
-
-    _pkg_dir = Path(os.path.dirname(os.path.abspath(__file__)))
-    candidates.append(_pkg_dir / "models" / "tokenizers" / "grapheme_mtl_merged_expanded_v1.json")
-
-    # HF cache
-    for path in glob.glob(os.path.expanduser(
-            "~/.cache/huggingface/hub/models--ResembleAI--chatterbox/*/grapheme_mtl_merged_expanded_v1.json")):
-        candidates.append(Path(path))
-
-    for candidate in candidates:
-        if candidate.exists():
-            with open(candidate) as f:
-                data = json.load(f)
-            if "model" in data and "vocab" in data["model"]:
-                vocab_data = data["model"]["vocab"]
-                if isinstance(vocab_data, dict):
-                    return vocab_data
-                elif isinstance(vocab_data, list):
-                    return {tok: i for i, (tok, _score) in enumerate(vocab_data)}
-
-    return {}
-
-
-def _extend_t3_state_with_phonemes(state_dict: dict, new_vocab_size: int,
-                                    ckpt_dir: Path = None) -> dict:
-    """Extend T3 state dict from BPE-only (2454) to BPE+phoneme vocab.
-
-    Adds new rows to text_emb.weight and text_head.weight.
-    New embedding rows initialized from related grapheme embeddings
-    (smart init from phoneme_tokens.py). Original weights untouched.
-
-    Args:
-        state_dict: original T3 state dict with [2454, dim] text weights
-        new_vocab_size: target vocab size (2454 + N_phoneme_tokens)
-        ckpt_dir: directory to search for vocab JSON
-
-    Returns:
-        Modified state dict with extended text_emb and text_head.
-    """
-    import logging
-    from .phoneme_tokens import initialize_phoneme_embeddings
-
-    _logger = logging.getLogger(__name__)
-
-    old_emb = state_dict["text_emb.weight"]  # [2454, 1024]
-    old_head = state_dict["text_head.weight"]  # [2454, 1024]
-    old_size, dim = old_emb.shape
-    n_new = new_vocab_size - old_size
-
-    assert n_new > 0, f"new_vocab_size ({new_vocab_size}) must be > old ({old_size})"
-
-    # Load BPE vocab for grapheme→ID mapping
-    bpe_vocab = _load_bpe_vocab(ckpt_dir)
-    if bpe_vocab:
-        _logger.info(f"Loaded BPE vocab ({len(bpe_vocab)} tokens) for phoneme init")
-    else:
-        _logger.warning("BPE vocab not found — phoneme embeddings will use random init")
-
-    # text_emb: smart init from grapheme mappings
-    new_emb_rows = initialize_phoneme_embeddings(old_emb, bpe_vocab)  # [n_new, dim]
-    state_dict["text_emb.weight"] = torch.cat([old_emb, new_emb_rows], dim=0)
-
-    # text_head: random init with matching std
-    head_std = old_head.std().item()
-    new_head_rows = torch.zeros(n_new, dim)
-    new_head_rows.normal_(0, head_std)
-    state_dict["text_head.weight"] = torch.cat([old_head, new_head_rows], dim=0)
-
-    _logger.info(
-        f"Extended T3: text_emb {old_size}→{new_vocab_size}, "
-        f"text_head {old_size}→{new_vocab_size} "
-        f"({n_new} phoneme tokens added)"
-    )
-
-    return state_dict
-
 
 class ChatterboxMultilingualTTS:
     ENC_COND_LEN = 6 * S3_SR
@@ -260,8 +173,7 @@ class ChatterboxMultilingualTTS:
         return SUPPORTED_LANGUAGES.copy()
 
     @classmethod
-    def from_local(cls, ckpt_dir, device, meanflow=False, meanflow_ckpt_dir=None,
-                   phoneme_mode=False) -> 'ChatterboxMultilingualTTS':
+    def from_local(cls, ckpt_dir, device, meanflow=False, meanflow_ckpt_dir=None) -> 'ChatterboxMultilingualTTS':
         ckpt_dir = Path(ckpt_dir)
 
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
@@ -276,36 +188,14 @@ class ChatterboxMultilingualTTS:
         )
         ve.to(device).eval()
 
-        # --- T3 with optional phoneme embedding extension ---
-        if phoneme_mode:
-            t3_config = T3Config.multilingual_phoneme()
-        else:
-            t3_config = T3Config.multilingual()
-
+        t3_config = T3Config.multilingual()
         t3 = T3(t3_config)
 
-        # Load pretrained weights
-        t3_ckpt = ckpt_dir / "t3_phoneme.safetensors"
-        if not t3_ckpt.exists():
-            t3_ckpt = ckpt_dir / "t3_mtl23ls_v2.safetensors"
-
+        t3_ckpt = ckpt_dir / "t3_mtl23ls_v2.safetensors"
         t3_state = load_safetensors(t3_ckpt)
         if "model" in t3_state.keys():
             t3_state = t3_state["model"][0]
-
-        if phoneme_mode and t3_state["text_emb.weight"].shape[0] == BPE_VOCAB_SIZE:
-            # Old checkpoint (2454 tokens) → extend with phoneme embeddings
-            import logging
-            _logger = logging.getLogger(__name__)
-            _logger.info("Extending T3 with phoneme embeddings (2454 → %d tokens)",
-                         t3_config.text_tokens_dict_size)
-            t3_state = _extend_t3_state_with_phonemes(
-                t3_state, t3_config.text_tokens_dict_size, ckpt_dir=ckpt_dir,
-            )
-            t3.load_state_dict(t3_state, strict=True)
-        else:
-            # Either not phoneme mode, or checkpoint already has extended vocab
-            t3.load_state_dict(t3_state, strict=True)
+        t3.load_state_dict(t3_state, strict=True)
 
         t3.to(device).eval()
 
@@ -324,7 +214,6 @@ class ChatterboxMultilingualTTS:
 
         tokenizer = MTLTokenizer(
             str(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"),
-            phoneme_mode=phoneme_mode,
         )
 
         conds = None
@@ -334,8 +223,7 @@ class ChatterboxMultilingualTTS:
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
 
     @classmethod
-    def from_pretrained(cls, device: torch.device, meanflow: bool = False,
-                        phoneme_mode: bool = False) -> 'ChatterboxMultilingualTTS':
+    def from_pretrained(cls, device: torch.device, meanflow: bool = False) -> 'ChatterboxMultilingualTTS':
         """Load pretrained multilingual ChatterBox model.
 
         Args:
@@ -343,8 +231,6 @@ class ChatterboxMultilingualTTS:
             meanflow: if True, load meanflow S3Gen weights from the turbo repo.
                 Uses 2 ODE steps instead of 10 + no CFG batch doubling = ~5-7x CFM speedup.
                 Quality may differ — the meanflow weights were distilled from English data.
-            phoneme_mode: if True, extend vocab with IPA phoneme tokens for
-                EU languages (IT/EN/FR/DE/ES/PT). Original weights preserved.
         """
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
@@ -377,8 +263,7 @@ class ChatterboxMultilingualTTS:
             )
 
         return cls.from_local(ckpt_dir, device, meanflow=meanflow,
-                              meanflow_ckpt_dir=meanflow_ckpt_dir,
-                              phoneme_mode=phoneme_mode)
+                              meanflow_ckpt_dir=meanflow_ckpt_dir)
     
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
         ## Load reference wav

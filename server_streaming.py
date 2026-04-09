@@ -119,7 +119,7 @@ def create_app(model_type: str = "multilingual"):
     # --- Custom dictionary (shared, thread-safe for reads) ---
     from chatterbox.g2p import CustomDictionary, G2PPipeline
     _dictionary = CustomDictionary()
-    _g2p = G2PPipeline(custom_dict=_dictionary)
+    _g2p = G2PPipeline(custom_dict=_dictionary, auto_respell=True)
     _dict_lock = threading.Lock()
 
     # --- Inference serialization ---
@@ -157,8 +157,17 @@ def create_app(model_type: str = "multilingual"):
             cfm_context_frames=params.get("cfm_context_frames", 30),
         )
 
+        # --- G2P preprocessing: respell foreign/difficult words ---
+        text = params["text"]
+        lang = params.get("language_id", "")
+        if lang and not (text.strip().startswith("<speak") or text.strip().startswith("<phoneme")):
+            processed = _g2p.process(text, lang)
+            if processed != text:
+                logger.info(f"G2P [{lang}]: '{text[:80]}' → '{processed[:80]}'")
+                text = processed
+
         gen_kwargs = {
-            "text": params["text"],
+            "text": text,
             "temperature": params.get("temperature", 0.8),
             "repetition_penalty": params.get("repetition_penalty", 1.2),
             "exaggeration": params.get("exaggeration", 0.5),
@@ -440,7 +449,6 @@ def main():
                         choices=["standard", "multilingual", "turbo"],
                         help="Model type to load")
     parser.add_argument("--preload", action="store_true", help="Preload model on startup")
-    parser.add_argument("--int8", action="store_true", help="Enable INT8 quantization for T3")
     parser.add_argument("--dict", nargs="*", metavar="YAML_PATH",
                         help="Load dictionary YAML files on startup")
     parser.add_argument("--dict-lang", default=None,
@@ -455,18 +463,6 @@ def main():
     if args.preload:
         logger.info("Preloading model...")
         model = model_loader()
-        if args.int8 and model is not None:
-            logger.warning(
-                "INT8 quantization is currently disabled: torch.ao dynamic INT8 "
-                "only supports CPU, not CUDA. Use --no-int8 or remove --int8 flag. "
-                "Future: GPTQ/AWQ for CUDA-native quantization."
-            )
-            # from chatterbox.int8_quantization import quantize_t3_int8
-            # result = quantize_t3_int8(model)
-            # NOTE: quantize_t3_int8 also breaks T3.device property
-            # (nn.Module wrapping removes the @property accessor).
-            # If re-enabling, must monkey-patch: type(model.t3).device = property(...)
-
         logger.info("Model loaded.")
 
     try:

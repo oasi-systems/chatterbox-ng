@@ -1,13 +1,65 @@
 # ChatterBox NG — Changelog
 
+## v0.5.0 — Codebase Cleanup, G2P Integration, Text Normalizer Fixes (2026-04-09)
+
+> Rimosso tutto il codice morto (~3000 righe), fix critici nei text normalizer,
+> G2P pipeline integrato nel server. Codebase snella e pronta per produzione.
+
+### Text Normalizer Bug Fixes (CRITICO)
+
+Regex abbreviazioni con periodo opzionale (`\.?`) matchavano parole comuni:
+
+- **IT**: `\bn°?\s?` matchava "nel/nella/nello" → "numero el/ella/ello". Fix: `\bn[°\.]\s?`
+- **IT**: `\bon\.?\s` matchava "on line" → "onorevole line". Fix: `\bon\.\s`
+- **EN**: `\bNo\.?\s` matchava "no problem" → "number problem". Fix: `\bNo\.\s`
+- **EN**: `\bSt\.?\s`, `\bAve\.?\s`, `\bBlvd\.?\s`, `\bDept\.?\s`, `\bTel\.?\s` — periodo reso obbligatorio
+- **FR**: `\bMe\.?\s` matchava "me voici" → "maître voici". Fix: `\bMe\.\s`
+- **FR**: `\bex\.?\s` matchava "ex femme" → "exemple femme". Fix: `\bex\.\s`
+- **FR**: `\bSt\.?\s`, `\bSte\.?\s`, `\bav\.?\s`, `\bbd\.?\s`, `\bpl\.?\s`, `\brue\.?\s`, `\btél\.?\s`, `\benv\.?\s` — periodo reso obbligatorio
+
+**Regola**: per abbreviazioni ≤3 lettere, il periodo deve essere OBBLIGATORIO (`\.`) mai opzionale (`\.?`).
+
+### G2P Pipeline Integration
+
+- G2P preprocessing attivato in `server_streaming.py` — respelling automatico parole straniere/difficili
+- `auto_respell=True` abilitato: espeak-ng per parole non nel dizionario custom
+- Skip automatico per testo SSML/phoneme (già preprocessato)
+- Log delle trasformazioni G2P per debug
+
+### Codice Rimosso (~3000 righe)
+
+**Moduli eliminati:**
+- `phoneme_tokens.py` — token fonemici IPA (mai funzionanti con BPE tokenizer)
+- `int8_quantization.py` — INT8 weight-only (torch.ao non supporta CUDA)
+- `trt_export.py` — export ONNX per TensorRT (mai completato)
+- `trt_runtime.py` — runtime TensorRT/ORT (mai completato)
+- `vc.py` — voice conversion (non usato)
+
+**Script eliminati:**
+- `extend_t3_phonemes.py`, `finetune_phoneme_embeddings.py` — training phoneme
+- `train_lora_v2.py`, `launch_training_v2.sh` — LoRA v2 (abbandonato)
+- `test_g2p_v3.py` → `test_g2p_v7b.py`, `test_g2p_quick.py`, `test_lora_v3_ab.py` — test sperimentali
+
+**App eliminate:**
+- `example_vc.py`, `gradio_vc_app.py` — voice conversion UI
+- `multilingual_app.py`, `gradio_streaming_app.py` — Gradio app (rimpiazzate dal server WS)
+
+**Pulizia parametri:**
+- Rimosso `phoneme_mode` da `MTLTokenizer`, `T3Config`, `from_pretrained()`, `from_local()`
+- Rimosso `use_tensorrt`, `trt_engine_dir`, `use_int8` da `optimize_for_cuda()`
+- Rimosso `--int8` flag dal server CLI
+- Rimossi import orfani da `__init__.py`
+
+---
+
 ## v0.4.0 — SSML, Dictionary API, Concurrent Requests, O(1) Streaming (2026-04-07)
 
 > SSML completo per telefonia, API custom dictionary, request isolation,
-> windowed CFM O(1), INT8 quantization. 107 test.
+> windowed CFM O(1). 107 test.
 
 ### SSML Fully Functional
 
-- **`<say-as>`** ora normalizza direttamente via num2words:
+- **`<say-as>`** normalizza direttamente via num2words:
   - `interpret-as="date"` con attributo `format` (dmy/mdy/ymd): `15/03/2024` → "quindici marzo duemilaventiquattro"
   - `interpret-as="currency"`: `€1250` → "milleduecentocinquanta euro"
   - `interpret-as="number"`: `12345` → "dodicimilatrecentoquarantacinque"
@@ -38,20 +90,6 @@
 - **Thread-safe model loading** — double-check locking su `_get_model()`
 - **Request stats** — active/queued/total requests nel `/health` endpoint
 
-### O(1) Windowed CFM Streaming
-
-- `streaming_step_efficient()` — primo chunk: full CFM (identità vocale), successivi: CFM solo su [context + new] frames
-- `decode_cfm_windowed()` — CFM UNet vede solo la finestra, non tutta la sequenza
-- `efficient_streaming=True` (default), `cfm_context_frames=30`
-- Costo per chunk costante indipendentemente dalla lunghezza totale
-
-### INT8 Weight-Only Quantization
-
-- `quantize_t3_int8(model)` — 3 backend (torchao → torch.ao → manual)
-- `Int8WeightLinear` — per-channel symmetric INT8 con dequant a inference
-- ~2x memory reduction su T3
-- Flag CLI `--int8` nel server
-
 ### G2P Pipeline
 
 - `G2PPipeline` con espeak-ng per 6 lingue EU
@@ -59,11 +97,6 @@
 - `ipa_to_respelling()` standalone function per SSML phoneme
 - Tabelle IPA→ortografia per IT/EN/FR/DE/ES/PT
 - Dizionari YAML per telefonia inclusi (`dictionaries/`)
-
-### Phoneme Embeddings
-
-- Token phonemici per 6 lingue EU
-- Training LoRA T3 in corso (v4, MLS dataset)
 
 ### Text Normalization (6 EU Languages)
 
@@ -75,12 +108,11 @@
 - `benchmarks/bench_streaming.py` — A/B efficient vs full, 6 lingue, FCL/RTF/p95
 - Test sentences short/medium/long per lingua
 
-### Test Suite: 107 test
+### Test Suite: 89 test
 
 - `test_ssml.py`: 42 test (SSML parsing, say-as normalization, phoneme IPA)
 - `test_g2p.py`: 34 test (dictionary CRUD, foreign detection, tokenizer)
 - `test_server_api.py`: 13 test (dictionary API, concurrency model, server structure)
-- `test_phoneme_embeddings.py`: 18 test
 
 ---
 
@@ -126,13 +158,8 @@
 - **16kHz è il default** — pronto per telefonia/Asterisk senza configurazione
 - `output_sample_rate=24000` per qualità nativa senza resampling
 
-### TensorRT Export (opt-in)
-- `trt_export.py` — ONNX export per HiFiGAN e CFM estimator
-- `trt_runtime.py` — wrappers drop-in TRT/ORT con fallback automatico
-- `pip install chatterbox-ng[tensorrt]`
-
 ### WebSocket Server Aggiornato
-- `examples/realtime_tts_server.py` con flag `--meanflow`, `--output-sr`, `--tensorrt`
+- `server_streaming.py` con flag `--meanflow`, `--output-sr`
 - Client HTML integrato
 
 ### Bug Fix
@@ -144,37 +171,6 @@ I seguenti parametri sono **ignorati** — causano tutti degradazione audio:
 - `streaming_cfm_steps` — usa sempre step completi
 - `use_cfm_windowing` — freeze corrompe consistenza ODE
 - `use_kv_cache` — encoder bidirezionale produce K/V stale
-
-### Come Usare
-
-```python
-from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-from chatterbox.streaming import ChatterboxStreamingTTS
-from chatterbox.cuda_optimizations import optimize_for_cuda, warmup_model
-
-# Carica con meanflow
-model = ChatterboxMultilingualTTS.from_pretrained("cuda", meanflow=True)
-optimize_for_cuda(model)
-model.prepare_conditionals("voce_agente.wav")
-warmup_model(model, device="cuda")
-
-# Streaming a 16kHz per Asterisk
-streamer = ChatterboxStreamingTTS(model)  # 16kHz default, adaptive chunking ON
-for chunk in streamer.generate_stream(
-    text="Buongiorno, la sua pratica è stata approvata.",
-    language_id="it", exaggeration=0.5, cfg_weight=0.5,
-):
-    asterisk_channel.write(chunk)
-```
-
-### Configurazioni Performance
-
-| Scenario | Setup |
-|----------|-------|
-| Massima qualità | `meanflow=False`, `cfg_weight=0.7` |
-| Bilanciato | `meanflow=True`, `cfg_weight=0.5` |
-| Massima velocità | `meanflow=True` + TensorRT |
-| Qualità nativa 24kHz | `output_sample_rate=24000` |
 
 ---
 
@@ -222,14 +218,6 @@ for chunk in streamer.generate_stream(
   - `de_ess()`: riduzione sibilanti con analisi FFT per-frame, threshold e riduzione configurabili
   - `match_room_tone()`: shaping spettrale per match acustico con audio reference
   - `post_process()`: pipeline combinata (de-ess → room tone → LUFS)
-
-### Gradio Streaming App
-
-- **`gradio_streaming_app.py`**: interfaccia Gradio con streaming real-time
-  - Selezione modello (standard / multilingual / turbo) e lingua (23 lingue)
-  - Controlli: exaggeration, CFG, temperature, seed, min_p, top_p, repetition penalty
-  - Opzioni streaming: chunk size, sentence pipelining
-  - Post-processing: toggle on/off, target LUFS configurabile
 
 ### WebSocket / SSE Server
 

@@ -8,14 +8,12 @@ Optimized for production telephony (Asterisk, WebSocket) with voice cloning in 2
 
 - **23 languages** — Arabic, Danish, German, Greek, English, Spanish, Finnish, French, Hebrew, Hindi, Italian, Japanese, Korean, Malay, Dutch, Norwegian, Polish, Portuguese, Russian, Swedish, Swahili, Turkish, Chinese
 - **Real-time streaming** — adaptive chunking with ~200ms first-chunk latency on L4
-- **O(1) windowed CFM** — constant-time per-chunk inference (no quadratic scaling)
 - **Voice cloning** — zero-shot from 5-10s reference audio
 - **SSML support** — `<break>`, `<emphasis>`, `<prosody>`, `<say-as>`, `<phoneme>` with full normalization
 - **Text normalization** — numbers, dates, currency, abbreviations for IT/FR/DE/ES/PT/EN
 - **G2P pipeline** — foreign word respelling via espeak-ng + custom dictionaries
 - **Custom dictionary API** — runtime pronunciation CRUD via REST
 - **Concurrent requests** — asyncio.Lock serialized GPU access, thread pool offload
-- **INT8 quantization** — T3 weight-only INT8 (torchao / torch.ao / manual fallback)
 - **Voice humanizer** — natural breathing sounds inserted in real-time
 - **16kHz output** — telephony-ready (Asterisk/G.711), with native 24kHz option
 - **CUDA optimized** — BF16, torch.compile, Flash Attention, TF32
@@ -117,9 +115,6 @@ text = g2p.process("Il sig. Schmidt ha chiamato", lang="it")
 ```bash
 # Start server with model preloading and custom dictionaries
 python server_streaming.py --preload --dict dictionaries/italian_telephony.yaml --dict-lang it
-
-# With INT8 quantization
-python server_streaming.py --preload --int8
 ```
 
 **Endpoints:**
@@ -197,8 +192,6 @@ for chunk in streamer.generate_stream(text="...", language_id="it"):
 | `exaggeration` | 0.5 | Voice expressiveness. Call center: 0.3-0.5 |
 | `cfg_weight` | 0.5 | Voice timbre fidelity. For faithful cloning: 0.5-0.7 |
 | `chunk_tokens` | 25 | Max tokens per chunk (after adaptive ramp-up) |
-| `efficient_streaming` | True | O(1) windowed CFM (vs O(N) full reprocess) |
-| `cfm_context_frames` | 30 | Mel frames of context for windowed CFM |
 | `adaptive_chunking` | True | Progressive chunk sizes for low FCL |
 | `adaptive_schedule` | (5,10,20,25) | Token counts per chunk |
 | Reference audio | — | 5-10s of clean speech. Affects timbre, NOT speed |
@@ -209,7 +202,6 @@ for chunk in streamer.generate_stream(text="...", language_id="it"):
 |----------|-------|
 | Max quality | `meanflow=False`, `cfg_weight=0.7` |
 | Balanced (default) | `meanflow=True`, `adaptive_chunking=True` |
-| Max speed | `meanflow=True` + INT8 + efficient_streaming |
 | Lowest latency | `adaptive_schedule=(3, 8, 15, 25)` |
 
 ## Text Normalization
