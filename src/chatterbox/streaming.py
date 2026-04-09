@@ -358,7 +358,7 @@ class ChatterboxStreamingTTS:
         repetition_penalty: float = 1.2,
         min_p: float = 0.05,
         top_p: float = 0.95,
-        cfg_weight: float = 0.0,
+        cfg_weight: float = 0.5,
         exaggeration: float = 0.7,
         # S3Gen params
         n_cfm_timesteps: Optional[int] = None,

@@ -178,7 +178,7 @@ def create_app(model_type: str = "multilingual"):
             "temperature": params.get("temperature", 0.8),
             "repetition_penalty": params.get("repetition_penalty", 1.2),
             "exaggeration": params.get("exaggeration", 0.5),
-            "cfg_weight": params.get("cfg_weight", 0.0),
+            "cfg_weight": params.get("cfg_weight", 0.5),
             "sentence_pipelining": params.get("sentence_pipelining", True),
         }
         if prompt_path:
