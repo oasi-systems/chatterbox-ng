@@ -233,24 +233,12 @@ def _compile_submodules(model, mode):
     - HiFiGAN (5%): lightweight, skip compile (overhead not worth it)
     - T3 (13%): transformer backbone benefits from kernel fusion
     """
-    try:
-        # S3Gen flow (encoder + CFM estimator) — NOT compiled.
-        # Streaming re-encodes ALL accumulated tokens each chunk, so the
-        # encoder input shape grows every call. torch.compile with dynamic=True
-        # still fails on shape-dependent operations (clamp, make_pad_mask).
-        # The 53% + 29% = 82% of S3Gen time runs in eager mode.
-        # Future: TensorRT with dynamic shape profiles can handle this.
-
-        # HiFiGAN vocoder (5%) — skip, not worth the compile overhead
-
-        # T3 backbone (LlamaModel or GPT2Model) — safe to compile.
-        # T3 generates one token at a time (fixed shape per step).
-        if hasattr(model, 't3') and hasattr(model.t3, 'tfmr'):
-            model.t3.tfmr = torch.compile(model.t3.tfmr, mode=mode, dynamic=True)
-            logger.info(f"  Compiled: T3 backbone (mode={mode})")
-
-    except Exception as e:
-        logger.warning(f"torch.compile failed (will continue without): {e}")
+    # Nothing compiled — profiling shows all sub-modules are faster without compile:
+    # - S3Gen (82%): shape-dependent ops break torch.compile
+    # - T3 (13%): torch.compile(dynamic=True) causes 30% SLOWDOWN due to dynamo
+    #   cache thrashing on KV-cache shape changes. SDPA provides kernel fusion.
+    # - HiFiGAN (5%): too small to benefit
+    logger.info("  No sub-modules compiled (all faster in eager mode on L4)")
 
 
 def _upgrade_encoder_attention(model):
