@@ -126,6 +126,50 @@ python server_streaming.py --preload --dict dictionaries/italian_telephony.yaml 
 | `/api/dictionary` | GET/POST/DELETE | Custom dictionary CRUD |
 | `/health` | GET | Server status, request queue, features |
 
+**WebSocket protocol (`/ws/tts`):**
+
+1. Client sends JSON with text + parameters
+2. Server replies JSON `{"status": "generating", "sample_rate": 16000}`
+3. Server streams binary frames (raw float32 PCM at `output_sample_rate`)
+4. Server sends JSON `{"status": "done"}`
+
+```python
+import asyncio, json, struct
+import websockets
+import numpy as np
+
+async def synthesize(text, language="it", ref_audio_b64=None):
+    async with websockets.connect("ws://localhost:8765/ws/tts") as ws:
+        # 1. Send request
+        await ws.send(json.dumps({
+            "text": text,
+            "language_id": language,
+            "audio_prompt_b64": ref_audio_b64,  # base64-encoded WAV (optional)
+            # Optional parameters (with defaults):
+            # "temperature": 0.8,
+            # "repetition_penalty": 1.2,
+            # "exaggeration": 0.5,
+            # "cfg_weight": 0.5,
+            # "output_sample_rate": 16000,
+            # "chunk_tokens": 25,
+            # "sentence_pipelining": true,
+        }))
+
+        # 2. Receive chunks
+        audio_chunks = []
+        async for message in ws:
+            if isinstance(message, bytes):
+                # Binary frame = float32 PCM audio chunk
+                chunk = np.frombuffer(message, dtype=np.float32)
+                audio_chunks.append(chunk)
+            else:
+                status = json.loads(message)
+                if status.get("status") == "done":
+                    break
+
+        return np.concatenate(audio_chunks)  # full audio at output_sample_rate
+```
+
 **Dictionary API examples:**
 
 ```bash
