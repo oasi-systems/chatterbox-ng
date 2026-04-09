@@ -116,10 +116,10 @@ def create_app(model_type: str = "multilingual"):
             optimize_for_cuda(model, compile_mode="default", use_bf16=True)
         return model
 
-    # --- Custom dictionary (shared, thread-safe for reads) ---
-    from chatterbox.g2p import CustomDictionary, G2PPipeline
+    # --- Custom dictionary (shared via global G2P singleton) ---
+    from chatterbox.g2p import CustomDictionary, configure_default_pipeline, get_default_pipeline
     _dictionary = CustomDictionary()
-    _g2p = G2PPipeline(custom_dict=_dictionary, auto_respell=True)
+    configure_default_pipeline(custom_dict=_dictionary, auto_respell=True)
     _dict_lock = threading.Lock()
 
     # --- Inference serialization ---
@@ -157,17 +157,8 @@ def create_app(model_type: str = "multilingual"):
             cfm_context_frames=params.get("cfm_context_frames", 30),
         )
 
-        # --- G2P preprocessing: respell foreign/difficult words ---
-        text = params["text"]
-        lang = params.get("language_id", "")
-        if lang and not (text.strip().startswith("<speak") or text.strip().startswith("<phoneme")):
-            processed = _g2p.process(text, lang)
-            if processed != text:
-                logger.info(f"G2P [{lang}]: '{text[:80]}' → '{processed[:80]}'")
-                text = processed
-
         gen_kwargs = {
-            "text": text,
+            "text": params["text"],
             "temperature": params.get("temperature", 0.8),
             "repetition_penalty": params.get("repetition_penalty", 1.2),
             "exaggeration": params.get("exaggeration", 0.5),
@@ -460,6 +451,15 @@ def main():
     logger.info(f"Model type: {args.model}")
 
     app, model_loader = create_app(args.model)
+
+    # Load startup dictionaries into the global G2P singleton
+    if args.dict:
+        from chatterbox.g2p import get_default_pipeline
+        pipeline = get_default_pipeline()
+        for yaml_path in args.dict:
+            pipeline.dictionary.load_yaml(yaml_path, language_id=args.dict_lang)
+            logger.info(f"Loaded dictionary: {yaml_path}")
+
     if args.preload:
         logger.info("Preloading model...")
         model = model_loader()

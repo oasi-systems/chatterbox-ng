@@ -31,6 +31,7 @@ Dependencies:
 
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -767,13 +768,42 @@ def _tokenize_for_g2p(text: str) -> list[str]:
 
 # Module-level singleton for simple usage
 _default_pipeline: Optional[G2PPipeline] = None
+_pipeline_lock = threading.Lock()
+
+
+def configure_default_pipeline(
+    custom_dict: "CustomDictionary" = None,
+    auto_respell: bool = False,
+) -> G2PPipeline:
+    """Configure the global G2P singleton. Call once at startup.
+
+    If a singleton already exists, updates its dictionary and auto_respell flag.
+    If not, creates one with the given parameters. Thread-safe, idempotent.
+
+    The configured singleton is shared by the tokenizer, SSML, and all
+    convenience functions via get_default_pipeline().
+    """
+    global _default_pipeline
+    with _pipeline_lock:
+        if _default_pipeline is None:
+            _default_pipeline = G2PPipeline(
+                custom_dict=custom_dict or CustomDictionary(),
+                auto_respell=auto_respell,
+            )
+        else:
+            if custom_dict is not None:
+                _default_pipeline.dictionary = custom_dict
+            _default_pipeline.auto_respell = auto_respell
+    return _default_pipeline
 
 
 def get_default_pipeline() -> G2PPipeline:
     """Get or create the default G2P pipeline singleton."""
     global _default_pipeline
     if _default_pipeline is None:
-        _default_pipeline = G2PPipeline()
+        with _pipeline_lock:
+            if _default_pipeline is None:
+                _default_pipeline = G2PPipeline()
     return _default_pipeline
 
 
