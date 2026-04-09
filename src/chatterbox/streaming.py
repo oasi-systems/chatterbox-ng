@@ -142,12 +142,6 @@ class ChatterboxStreamingTTS:
         humanize: bool = False,
         humanizer_reference: str = None,  # path to reference audio for breath adaptation
         humanizer = None,  # pre-built VoiceHumanizer instance (reuse across calls)
-        # Deprecated — kept for API compat, ignored
-        streaming_cfm_steps: int = None,
-        use_cfm_windowing: bool = False,
-        cfm_context_frames: int = 30,
-        use_kv_cache: bool = False,
-        efficient_streaming: bool = False,
     ):
         """
         Args:
@@ -184,18 +178,6 @@ class ChatterboxStreamingTTS:
             # Benchmarked: -53% to -59% FCL vs fixed 15-token first chunk,
             # with equal or better perceived audio quality.
             self.adaptive_schedule = (5, 10, 20, chunk_tokens)
-        # Always use full ODE steps — quality must match monolithic.
-        # Speed comes from meanflow (2 steps by design), not from reducing steps.
-        self.streaming_cfm_steps = None
-        self.use_cfm_windowing = False
-        self.cfm_context_frames = cfm_context_frames
-        self.use_kv_cache = False
-
-        # Efficient streaming: windowed CFM decoder (O(1) per step instead of O(N²)).
-        # Uses full encoder (correct bidirectional) + CFM on [context + new] frames only.
-        # First chunk uses full CFM for voice identity, subsequent chunks use windowed.
-        self.efficient_streaming = efficient_streaming
-
         if output_sample_rate and output_sample_rate != S3GEN_SR:
             self._resampler = StreamingResampler(S3GEN_SR, output_sample_rate)
             self.sample_rate = output_sample_rate
@@ -557,13 +539,6 @@ class ChatterboxStreamingTTS:
             # but audio waveform stays continuous via HiFiGAN cache
             if not is_last_sentence:
                 stream_state.prev_stable_mel_len = 0
-                # Reset encoder caches and cached outputs for fresh sentence encoding
-                if hasattr(stream_state, 'encoder_caches') and stream_state.encoder_caches is not None:
-                    stream_state.encoder_caches = self.model.s3gen.flow.encoder.init_caches(
-                        self.model.device, next(self.model.s3gen.parameters()).dtype
-                    )
-                    stream_state.cached_encoder_output = None
-                    stream_state.cached_mel = None
 
     def _generate_stream_ssml(
         self,
@@ -689,12 +664,6 @@ class ChatterboxStreamingTTS:
             # Reset mel tracking for next segment (keep HiFiGAN cache)
             if not is_last:
                 stream_state.prev_stable_mel_len = 0
-                if hasattr(stream_state, 'encoder_caches') and stream_state.encoder_caches is not None:
-                    stream_state.encoder_caches = self.model.s3gen.flow.encoder.init_caches(
-                        self.model.device, next(self.model.s3gen.parameters()).dtype
-                    )
-                    stream_state.cached_encoder_output = None
-                    stream_state.cached_mel = None
 
     def _make_silence(self, duration_ms: float) -> Optional[np.ndarray]:
         """Generate silence at native sample rate (24kHz)."""
@@ -733,27 +702,17 @@ class ChatterboxStreamingTTS:
         [context + new] frames only (O(1) per step). Falls back to full
         reprocessing if efficient_streaming is disabled.
 
-        Speed comes from meanflow (2 ODE steps by design) + windowed CFM.
+        Speed comes from meanflow (2 ODE steps by design), not from shortcuts.
         """
         all_tokens = torch.cat(accumulated_tokens, dim=0).unsqueeze(0).to(self.model.device)
 
-        if self.efficient_streaming:
-            audio_chunk, updated_state = self.model.s3gen.streaming_step_efficient(
-                all_tokens=all_tokens,
-                ref_dict=self.model.conds.gen,
-                state=stream_state,
-                finalize=finalize,
-                n_cfm_timesteps=n_cfm_timesteps,
-                cfm_context_frames=self.cfm_context_frames,
-            )
-        else:
-            audio_chunk, updated_state = self.model.s3gen.streaming_step(
-                all_tokens=all_tokens,
-                ref_dict=self.model.conds.gen,
-                state=stream_state,
-                finalize=finalize,
-                n_cfm_timesteps=n_cfm_timesteps,
-            )
+        audio_chunk, updated_state = self.model.s3gen.streaming_step(
+            all_tokens=all_tokens,
+            ref_dict=self.model.conds.gen,
+            state=stream_state,
+            finalize=finalize,
+            n_cfm_timesteps=n_cfm_timesteps,
+        )
 
         # Update state in-place (copy all fields from updated state)
         for attr in vars(updated_state):

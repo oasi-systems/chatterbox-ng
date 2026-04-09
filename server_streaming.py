@@ -141,17 +141,15 @@ def create_app(model_type: str = "multilingual"):
     # --- Reusable streamer (avoid PerthNet reload + re-init per request) ---
     _streamer_cache = {"instance": None, "key": None}
 
-    def _get_streamer(model, chunk_tokens, output_sample_rate, efficient_streaming, cfm_context_frames):
+    def _get_streamer(model, chunk_tokens, output_sample_rate):
         """Get or create a ChatterboxStreamingTTS, reusing if config matches."""
         from chatterbox.streaming import ChatterboxStreamingTTS
-        key = (id(model), chunk_tokens, output_sample_rate, efficient_streaming, cfm_context_frames)
+        key = (id(model), chunk_tokens, output_sample_rate)
         if _streamer_cache["key"] != key:
             _streamer_cache["instance"] = ChatterboxStreamingTTS(
                 model,
                 chunk_tokens=chunk_tokens,
                 output_sample_rate=output_sample_rate,
-                efficient_streaming=efficient_streaming,
-                cfm_context_frames=cfm_context_frames,
             )
             _streamer_cache["key"] = key
         return _streamer_cache["instance"]
@@ -169,8 +167,6 @@ def create_app(model_type: str = "multilingual"):
             model,
             chunk_tokens=params.get("chunk_tokens", 25),
             output_sample_rate=params.get("output_sample_rate", 16000),
-            efficient_streaming=params.get("efficient_streaming", False),
-            cfm_context_frames=params.get("cfm_context_frames", 30),
         )
 
         gen_kwargs = {
@@ -427,7 +423,6 @@ def create_app(model_type: str = "multilingual"):
             "sample_rate": SAMPLE_RATE,
             "features": {
                 "ssml": True,
-                "efficient_streaming": True,
                 "custom_dictionary": True,
                 "concurrent_requests": True,
                 "languages": ["it", "en", "fr", "de", "es", "pt"],
