@@ -546,7 +546,9 @@ class T3(nn.Module):
 
         bos_token = torch.tensor([[self.hp.start_speech_token]], dtype=torch.long, device=device)
         bos_embed = self.speech_emb(bos_token) + self.speech_pos_emb.get_fixed_embedding(0)
-        bos_embed = torch.cat([bos_embed, bos_embed])  # CFG
+        use_cfg = cfg_weight > 0.0
+        if use_cfg:
+            bos_embed = torch.cat([bos_embed, bos_embed])  # CFG: batch=2
 
         inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
         generated_ids = bos_token.clone()
@@ -569,10 +571,13 @@ class T3(nn.Module):
         max_new_tokens = max_new_tokens or self.hp.max_speech_tokens
         for i in range(max_new_tokens):
             logits_step = output.logits[:, -1, :]
-            cond = logits_step[0:1, :]
-            uncond = logits_step[1:2, :]
-            cfg = torch.as_tensor(cfg_weight, device=cond.device, dtype=cond.dtype)
-            logits = cond + cfg * (cond - uncond)
+            if use_cfg:
+                cond = logits_step[0:1, :]
+                uncond = logits_step[1:2, :]
+                cfg = torch.as_tensor(cfg_weight, device=cond.device, dtype=cond.dtype)
+                logits = cond + cfg * (cond - uncond)
+            else:
+                logits = logits_step[0:1, :]
 
             if self.patched_model.alignment_stream_analyzer is not None:
                 if logits.dim() == 1:
@@ -599,7 +604,8 @@ class T3(nn.Module):
 
             next_token_embed = self.speech_emb(next_token)
             next_token_embed = next_token_embed + self.speech_pos_emb.get_fixed_embedding(i + 1)
-            next_token_embed = torch.cat([next_token_embed, next_token_embed])  # CFG
+            if use_cfg:
+                next_token_embed = torch.cat([next_token_embed, next_token_embed])  # CFG: batch=2
 
             output = self.patched_model(
                 inputs_embeds=next_token_embed,
