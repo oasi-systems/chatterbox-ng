@@ -80,8 +80,7 @@ class TTSEngine:
     """Wraps model + streaming for concurrent request handling."""
 
     def __init__(self, device: str = "cuda", voices_dir: str = "voices/",
-                 meanflow: bool = False, output_sr: int = 24000,
-                 trt_engine_dir: str = None):
+                 meanflow: bool = False, output_sr: int = 24000):
         from chatterbox.mtl_tts import ChatterboxMultilingualTTS
         from chatterbox.streaming import ChatterboxStreamingTTS
 
@@ -90,14 +89,10 @@ class TTSEngine:
         self.output_sr = output_sr
         self.device = device
 
-        # CUDA optimizations (with optional TensorRT)
+        # CUDA optimizations (BF16, SDPA, TF32)
         if "cuda" in str(device):
             from chatterbox.cuda_optimizations import optimize_for_cuda, warmup_model
-            optimize_for_cuda(
-                self.model,
-                use_tensorrt=trt_engine_dir is not None,
-                trt_engine_dir=trt_engine_dir,
-            )
+            optimize_for_cuda(self.model, use_bf16=True)
             logger.info("CUDA optimizations applied")
             self._warmup_fn = lambda: warmup_model(self.model, device=device)
         else:
@@ -271,13 +266,10 @@ def main():
                         help="Use meanflow S3Gen (2 ODE steps, ~5x faster CFM)")
     parser.add_argument("--output-sr", type=int, default=16000,
                         help="Output sample rate (default: 16000 for telephony, use 24000 for full quality)")
-    parser.add_argument("--tensorrt", default=None, metavar="DIR",
-                        help="Directory with TRT/ONNX engines (from python -m chatterbox.trt_export)")
     args = parser.parse_args()
 
     engine = TTSEngine(device=args.device, voices_dir=args.voices,
-                       meanflow=args.meanflow, output_sr=args.output_sr,
-                       trt_engine_dir=args.tensorrt)
+                       meanflow=args.meanflow, output_sr=args.output_sr)
 
     async def run():
         try:

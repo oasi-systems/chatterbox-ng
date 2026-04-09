@@ -1,24 +1,18 @@
 """
 ChatterBox NG — Production streaming on NVIDIA L4 GPU.
 
-Optimized for best quality/latency balance on L4 (24GB VRAM, Ada Lovelace).
+Optimized for real-time telephony (16kHz) with meanflow (2 ODE steps).
 
-Key tuning parameters for quality:
-- streaming_cfm_steps: ODE steps for intermediate chunks (more = better quality, slower)
-  - 4: fastest, slightly metallic
-  - 8: good balance (recommended for production)
-  - 12-16: near-standard quality, slower per chunk
-  Final chunk always uses model default (10 steps).
-
+Key tuning parameters:
 - chunk_tokens: speech tokens buffered before emitting audio (~40ms per token)
-  - 15: low latency, more chunks, slightly lower quality
-  - 25: default, good balance
-  - 40: fewer chunks, better quality per chunk
+  - 25: default, good TTFA/quality balance
+- exaggeration: 0.0–1.0, expressiveness (0.5 = natural for call center)
+- cfg_weight: 0.0–1.0, adherence to reference voice (0.5 = balanced)
 
-- context_frames: mel frames of context for CFM window (more = smoother transitions)
-  - 10: minimum viable
-  - 20: default
-  - 40: best continuity, slightly slower
+Performance on L4:
+- TTFA: ~173ms (adaptive schedule 5→10→20→25)
+- RTF: ~0.67x (comfortably real-time)
+- T3: ~17ms/tok (no torch.compile — SDPA handles kernel fusion)
 
 Usage:
     python l4_production_streaming.py --ref speaker.wav --text "Your text here"
@@ -34,26 +28,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def setup_model(device="cuda"):
+def setup_model(device="cuda", meanflow=True):
     """Load and optimize model for L4 production."""
-    from chatterbox.tts import ChatterboxTTS
-    from chatterbox.cuda_optimizations import optimize_for_cuda
+    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+    from chatterbox.cuda_optimizations import optimize_for_cuda, warmup_model
 
     logger.info("Loading model...")
-    model = ChatterboxTTS.from_pretrained(device)
+    model = ChatterboxMultilingualTTS.from_pretrained(device, meanflow=meanflow)
 
-    logger.info("Applying CUDA optimizations...")
-    optimize_for_cuda(
-        model,
-        compile_mode="reduce-overhead",  # best for repeated inference
-        use_bf16=True,                   # L4 supports BF16 natively
-        compile_models=True,             # compile encoder, CFM, HiFiGAN, T3
-    )
-
-    # Warmup — first inference triggers torch.compile tracing
-    logger.info("Warmup inference (torch.compile tracing)...")
-    _ = model.generate("Warmup.", audio_prompt_path=None)
-    logger.info("Model ready.")
+    logger.info("Applying CUDA optimizations (BF16, SDPA, TF32)...")
+    optimize_for_cuda(model, use_bf16=True)
 
     return model
 
@@ -63,28 +47,25 @@ def stream_tts(
     text: str,
     ref_audio: str,
     output_path: str = "output.wav",
-    # Quality/latency knobs
-    streaming_cfm_steps: int = 8,
+    output_sr: int = 16000,
     chunk_tokens: int = 25,
-    min_initial_tokens: int = 15,
-    # Generation params
     exaggeration: float = 0.5,
     cfg_weight: float = 0.5,
     temperature: float = 0.8,
     repetition_penalty: float = 1.2,
+    language_id: str = "it",
 ):
-    """Stream TTS with optimized settings for L4.
-
-    Returns:
-        tuple: (full_watermarked_audio, sample_rate, metrics_dict)
-    """
+    """Stream TTS with optimized settings for L4."""
     from chatterbox.streaming import ChatterboxStreamingTTS
+    from chatterbox.cuda_optimizations import warmup_model
+
+    model.prepare_conditionals(ref_audio, exaggeration=exaggeration)
+    warmup_model(model, device=model.device)
 
     streamer = ChatterboxStreamingTTS(
         model,
         chunk_tokens=chunk_tokens,
-        min_initial_tokens=min_initial_tokens,
-        streaming_cfm_steps=streaming_cfm_steps,
+        output_sample_rate=output_sr,
     )
 
     chunks = []
@@ -94,12 +75,11 @@ def stream_tts(
 
     for i, chunk in enumerate(streamer.generate_stream(
         text,
-        audio_prompt_path=ref_audio,
+        language_id=language_id,
         exaggeration=exaggeration,
         cfg_weight=cfg_weight,
         temperature=temperature,
         repetition_penalty=repetition_penalty,
-        sentence_pipelining=True,  # always recommended
     )):
         now = time.time()
         latency = now - t_start
@@ -117,85 +97,51 @@ def stream_tts(
         )
         t_start = now
 
-    # Watermark and save
-    full_audio = streamer.get_full_watermarked()
+    # Save
+    full_audio = np.concatenate(chunks)
     sf.write(output_path, full_audio, streamer.sample_rate)
 
     total_audio_dur = len(full_audio) / streamer.sample_rate
     total_wall = sum(chunk_latencies) / 1000
 
-    metrics = {
-        "total_audio_s": total_audio_dur,
-        "total_wall_s": total_wall,
-        "overall_rtf": total_wall / total_audio_dur,
-        "first_chunk_ms": first_chunk_time * 1000 if first_chunk_time else 0,
-        "mean_chunk_ms": np.mean(chunk_latencies),
-        "n_chunks": len(chunks),
-    }
-
     logger.info(f"\n{'='*50}")
-    logger.info(f"Audio duration:    {metrics['total_audio_s']:.2f}s")
-    logger.info(f"Wall time:         {metrics['total_wall_s']:.2f}s")
-    logger.info(f"Overall RTF:       {metrics['overall_rtf']:.2f}x")
-    logger.info(f"First chunk:       {metrics['first_chunk_ms']:.0f}ms")
-    logger.info(f"Mean chunk:        {metrics['mean_chunk_ms']:.0f}ms")
-    logger.info(f"Chunks:            {metrics['n_chunks']}")
+    logger.info(f"Audio duration:    {total_audio_dur:.2f}s")
+    logger.info(f"Wall time:         {total_wall:.2f}s")
+    logger.info(f"Overall RTF:       {total_wall / total_audio_dur:.2f}x")
+    logger.info(f"First chunk:       {first_chunk_time * 1000:.0f}ms")
+    logger.info(f"Mean chunk:        {np.mean(chunk_latencies):.0f}ms")
+    logger.info(f"Chunks:            {len(chunks)}")
     logger.info(f"Saved: {output_path}")
 
-    return full_audio, streamer.sample_rate, metrics
-
-
-# --- Quality presets ---
-
-PRESETS = {
-    "fast": {
-        "streaming_cfm_steps": 4,
-        "chunk_tokens": 15,
-        "min_initial_tokens": 10,
-    },
-    "balanced": {
-        "streaming_cfm_steps": 8,
-        "chunk_tokens": 25,
-        "min_initial_tokens": 15,
-    },
-    "quality": {
-        "streaming_cfm_steps": 12,
-        "chunk_tokens": 40,
-        "min_initial_tokens": 25,
-    },
-}
+    return full_audio, streamer.sample_rate
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ChatterBox NG — L4 Production Streaming")
-    parser.add_argument("--ref", required=True, help="Reference audio path for voice cloning")
+    parser.add_argument("--ref", required=True, help="Reference audio path")
     parser.add_argument("--text", required=True, help="Text to synthesize")
     parser.add_argument("--output", default="output.wav", help="Output audio path")
-    parser.add_argument("--preset", choices=PRESETS.keys(), default="balanced",
-                        help="Quality preset: fast, balanced, quality")
-    parser.add_argument("--cfm-steps", type=int, help="Override CFM ODE steps")
-    parser.add_argument("--chunk-tokens", type=int, help="Override chunk token count")
+    parser.add_argument("--output-sr", type=int, default=16000, help="Output sample rate (16000 for telephony)")
+    parser.add_argument("--chunk-tokens", type=int, default=25, help="Tokens per chunk")
+    parser.add_argument("--language", default="it", help="Language code")
     parser.add_argument("--exaggeration", type=float, default=0.5)
     parser.add_argument("--cfg-weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--no-meanflow", action="store_true", help="Disable meanflow (10 ODE steps, slower)")
     args = parser.parse_args()
 
-    model = setup_model(args.device)
-
-    preset = PRESETS[args.preset].copy()
-    if args.cfm_steps:
-        preset["streaming_cfm_steps"] = args.cfm_steps
-    if args.chunk_tokens:
-        preset["chunk_tokens"] = args.chunk_tokens
+    model = setup_model(args.device, meanflow=not args.no_meanflow)
 
     stream_tts(
         model,
         text=args.text,
         ref_audio=args.ref,
         output_path=args.output,
+        output_sr=args.output_sr,
+        chunk_tokens=args.chunk_tokens,
         exaggeration=args.exaggeration,
         cfg_weight=args.cfg_weight,
         temperature=args.temperature,
-        **preset,
+        language_id=args.language,
     )

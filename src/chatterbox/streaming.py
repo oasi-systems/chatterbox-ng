@@ -698,11 +698,9 @@ class ChatterboxStreamingTTS:
     ) -> Optional[np.ndarray]:
         """Run S3Gen on accumulated tokens and return new audio.
 
-        By default uses efficient streaming: full encoder + windowed CFM on
-        [context + new] frames only (O(1) per step). Falls back to full
-        reprocessing if efficient_streaming is disabled.
-
-        Speed comes from meanflow (2 ODE steps by design), not from shortcuts.
+        Uses full reprocess (encoder+CFM on entire sequence) — identical
+        quality to monolithic generate(). Speed comes from meanflow (2 ODE
+        steps by design), not from shortcuts.
         """
         all_tokens = torch.cat(accumulated_tokens, dim=0).unsqueeze(0).to(self.model.device)
 

@@ -115,8 +115,6 @@ def run_benchmark(
         min_initial_tokens=15,
         output_sample_rate=16000,
         adaptive_chunking=True,
-        efficient_streaming=efficient,
-        cfm_context_frames=30,
     )
 
     chunks = []
