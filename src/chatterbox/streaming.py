@@ -18,9 +18,7 @@ Sentence pipelining mode:
 """
 import logging
 import os
-import queue
 import re as _re
-import threading
 from typing import Generator, Tuple, Union, Optional, List
 
 import numpy as np
@@ -385,65 +383,8 @@ class ChatterboxStreamingTTS:
             )
             return
 
-        yield from self._generate_stream_async(
-            text=text, audio_prompt_path=audio_prompt_path, language_id=language_id,
-            temperature=temperature, repetition_penalty=repetition_penalty,
-            min_p=min_p, top_p=top_p, cfg_weight=cfg_weight, exaggeration=exaggeration,
-            n_cfm_timesteps=n_cfm_timesteps,
-        )
-
-    def _t3_producer(self, token_gen, chunk_queue, cancel_event):
-        """Background thread: runs T3 generator, pushes token snapshots to queue.
-
-        Protocol:
-            ("chunk", token_snapshot, chunk_index) — ready for S3Gen
-            ("done", final_tokens) — T3 finished (EOS/max tokens)
-            ("error", exception) — T3 crashed
-        """
-        try:
-            accumulated_tokens = []
-            tokens_since_last_emit = 0
-            chunk_index = 0
-
-            for token in token_gen:
-                if cancel_event.is_set():
-                    return
-
-                token_val = token.view(-1)
-                if token_val.item() < SPEECH_VOCAB_SIZE:
-                    accumulated_tokens.append(token_val)
-                tokens_since_last_emit += 1
-
-                threshold = self._get_chunk_threshold(chunk_index, chunk_index == 0)
-                if tokens_since_last_emit >= threshold and len(accumulated_tokens) > 0:
-                    chunk_queue.put(("chunk", list(accumulated_tokens), chunk_index))
-                    tokens_since_last_emit = 0
-                    chunk_index += 1
-
-            # T3 finished — send final snapshot
-            chunk_queue.put(("done", list(accumulated_tokens)))
-
-        except Exception as exc:
-            chunk_queue.put(("error", exc))
-
-    def _generate_stream_async(
-        self,
-        text: str,
-        audio_prompt_path: Optional[str],
-        language_id: Optional[str],
-        temperature: float, repetition_penalty: float,
-        min_p: float, top_p: float,
-        cfg_weight: float, exaggeration: float,
-        n_cfm_timesteps: Optional[int],
-    ) -> Generator[np.ndarray, None, None]:
-        """Async-pipelined streaming: T3 runs in background thread while S3Gen
-        processes chunks in the main thread. T3 never stalls waiting for S3Gen.
-
-        Produces identical audio to the sequential path — same streaming_step,
-        same token accumulation, same crossfade. Only the scheduling changes.
-        """
-        # --- Same setup as sequential path ---
         self._all_chunks = []
+        # Reset humanizer state for new utterance
         self._cumulative_speech_s = 0.0
         self._last_breath_time_s = -999.0
         self._audio_emitted_s = 0.0
@@ -452,69 +393,55 @@ class ChatterboxStreamingTTS:
         self._crossfade_buffer = None
         if self._resampler is not None:
             self._resampler.reset()
+        device = self.model.device
 
+        # --- Prepare conditionals ---
         if audio_prompt_path:
             self.model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
             assert self.model.conds is not None, "Call prepare_conditionals() first or provide audio_prompt_path"
 
-        text_tokens = self._tokenize_text(text, language_id, self.model.device)
-        stream_state = self.model.s3gen.init_streaming(ref_dict=self.model.conds.gen)
+        # --- Tokenize text ---
+        text_tokens = self._tokenize_text(text, language_id, device)
 
+        # --- Initialize streaming state (seed HiFiGAN from reference audio) ---
+        stream_state = self.model.s3gen.init_streaming(ref_dict=self.model.conds.gen)
+        accumulated_tokens = []
+
+        # --- Emit initial breath (masks cold-start artifacts like "BBuongiorno") ---
         initial_breath = self._get_initial_breath()
         if initial_breath is not None:
             yield initial_breath
 
+        # --- Start T3 streaming ---
         token_gen = self._start_t3_stream(
             text_tokens, cfg_weight, temperature,
             repetition_penalty, min_p, top_p,
         )
 
-        # --- Async pipeline: T3 in background, S3Gen in main thread ---
-        chunk_queue = queue.Queue(maxsize=2)
-        cancel_event = threading.Event()
-        producer = threading.Thread(
-            target=self._t3_producer,
-            args=(token_gen, chunk_queue, cancel_event),
-            daemon=True,
-            name="chatterbox-t3-producer",
-        )
-        producer.start()
+        # --- Stream tokens and emit audio chunks ---
+        tokens_since_last_emit = 0
+        chunk_index = 0  # tracks which chunk we're building (for adaptive schedule)
 
-        try:
-            while True:
-                msg = chunk_queue.get()
+        for token in token_gen:
+            token_val = token.view(-1)
+            if token_val.item() < SPEECH_VOCAB_SIZE:
+                accumulated_tokens.append(token_val)
+            tokens_since_last_emit += 1
 
-                if msg[0] == "error":
-                    raise msg[1]
+            threshold = self._get_chunk_threshold(chunk_index, stream_state.is_first_chunk)
+            if tokens_since_last_emit >= threshold and len(accumulated_tokens) > 0:
+                audio_chunk = self._emit_chunk(accumulated_tokens, stream_state, finalize=False, n_cfm_timesteps=n_cfm_timesteps)
+                if audio_chunk is not None:
+                    yield audio_chunk
+                tokens_since_last_emit = 0
+                chunk_index += 1
 
-                if msg[0] == "chunk":
-                    _, token_snapshot, _ = msg
-                    audio_chunk = self._emit_chunk(
-                        token_snapshot, stream_state,
-                        finalize=False, n_cfm_timesteps=n_cfm_timesteps,
-                    )
-                    if audio_chunk is not None:
-                        yield audio_chunk
-
-                elif msg[0] == "done":
-                    _, final_tokens = msg
-                    if final_tokens:
-                        audio_chunk = self._emit_chunk(
-                            final_tokens, stream_state,
-                            finalize=True, n_cfm_timesteps=n_cfm_timesteps,
-                        )
-                        if audio_chunk is not None:
-                            yield audio_chunk
-                    break
-        finally:
-            cancel_event.set()
-            while not chunk_queue.empty():
-                try:
-                    chunk_queue.get_nowait()
-                except queue.Empty:
-                    break
-            producer.join(timeout=5.0)
+        # --- Final chunk with finalize=True ---
+        if len(accumulated_tokens) > 0:
+            audio_chunk = self._emit_chunk(accumulated_tokens, stream_state, finalize=True, n_cfm_timesteps=n_cfm_timesteps)
+            if audio_chunk is not None:
+                yield audio_chunk
 
     def _generate_stream_pipelined(
         self,
