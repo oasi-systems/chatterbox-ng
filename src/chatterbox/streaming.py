@@ -147,7 +147,7 @@ class ChatterboxStreamingTTS:
         use_cfm_windowing: bool = False,
         cfm_context_frames: int = 30,
         use_kv_cache: bool = False,
-        efficient_streaming: bool = True,
+        efficient_streaming: bool = False,
     ):
         """
         Args:

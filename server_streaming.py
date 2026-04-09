@@ -169,7 +169,7 @@ def create_app(model_type: str = "multilingual"):
             model,
             chunk_tokens=params.get("chunk_tokens", 25),
             output_sample_rate=params.get("output_sample_rate", 16000),
-            efficient_streaming=params.get("efficient_streaming", True),
+            efficient_streaming=params.get("efficient_streaming", False),
             cfm_context_frames=params.get("cfm_context_frames", 30),
         )
 
