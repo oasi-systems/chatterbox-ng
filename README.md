@@ -7,7 +7,7 @@ Optimized for production telephony (Asterisk, WebSocket) with voice cloning in 2
 ## Features
 
 - **23 languages** — Arabic, Danish, German, Greek, English, Spanish, Finnish, French, Hebrew, Hindi, Italian, Japanese, Korean, Malay, Dutch, Norwegian, Polish, Portuguese, Russian, Swedish, Swahili, Turkish, Chinese
-- **Real-time streaming** — adaptive chunking with ~200ms first-chunk latency on L4
+- **Real-time streaming** — adaptive chunking with ~173ms first-chunk latency on L4 (RTF 0.67x)
 - **Voice cloning** — zero-shot from 5-10s reference audio
 - **SSML support** — `<break>`, `<emphasis>`, `<prosody>`, `<say-as>`, `<phoneme>` with full normalization
 - **Text normalization** — numbers, dates, currency, abbreviations for IT/FR/DE/ES/PT/EN
@@ -16,7 +16,7 @@ Optimized for production telephony (Asterisk, WebSocket) with voice cloning in 2
 - **Concurrent requests** — asyncio.Lock serialized GPU access, thread pool offload
 - **Voice humanizer** — natural breathing sounds inserted in real-time
 - **16kHz output** — telephony-ready (Asterisk/G.711), with native 24kHz option
-- **CUDA optimized** — BF16, torch.compile, Flash Attention, TF32
+- **CUDA optimized** — BF16, Flash Attention/SDPA, TF32, CFM decoder warmup
 
 ## Installation
 
@@ -196,13 +196,22 @@ for chunk in streamer.generate_stream(text="...", language_id="it"):
 | `adaptive_schedule` | (5,10,20,25) | Token counts per chunk |
 | Reference audio | — | 5-10s of clean speech. Affects timbre, NOT speed |
 
+### Performance (L4 GPU, meanflow=True)
+
+| Metric | Value |
+|--------|-------|
+| TTFA (first audio) | ~173ms |
+| RTF (real-time factor) | 0.67x |
+| T3 token speed | ~17ms/tok (60+ tok/s) |
+| Latency spikes | Zero (CFM decoder pre-warmed) |
+
 ### Performance Presets
 
 | Scenario | Setup |
 |----------|-------|
 | Max quality | `meanflow=False`, `cfg_weight=0.7` |
-| Balanced (default) | `meanflow=True`, `adaptive_chunking=True` |
-| Lowest latency | `adaptive_schedule=(3, 8, 15, 25)` |
+| Balanced (default) | `meanflow=True`, `cfg_weight=0.5` |
+| Lowest latency | `meanflow=True`, `adaptive_schedule=(3, 8, 15, 25)` |
 
 ## Text Normalization
 
