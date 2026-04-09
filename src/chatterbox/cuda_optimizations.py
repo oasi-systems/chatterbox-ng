@@ -123,6 +123,34 @@ def warmup_model(model, device="cuda", n_warmup: int = 3):
                 logger.warning(f"  Warmup pass {i+1} failed: {e}")
                 break
 
+    # --- Warmup CFM decoder estimator for all streaming mel frame sizes ---
+    # The estimator uses @maybe_allow_in_graph (diffusers) which triggers graph
+    # recompilation (~300ms) the first time it sees a new T (mel frames) dimension.
+    # In streaming, T grows every chunk, so without pre-warming each size causes
+    # a latency spike. We pre-run the estimator for T values from 20 to 200.
+    try:
+        estimator = model.s3gen.flow.decoder.estimator
+        est_dtype = estimator.dtype if hasattr(estimator, 'dtype') else torch.float32
+        dev = model.device
+        logger.info("  Warming up CFM decoder for streaming mel frame sizes...")
+        t_warmup_start = time.time()
+        n_shapes = 0
+        with torch.inference_mode():
+            for T in range(20, 202, 2):
+                x = torch.randn(1, 80, T, device=dev, dtype=est_dtype)
+                mask = torch.ones(1, 1, T, device=dev, dtype=est_dtype)
+                mu = torch.randn(1, 80, T, device=dev, dtype=est_dtype)
+                t_val = torch.tensor([0.5], device=dev, dtype=est_dtype)
+                r_val = torch.tensor([1.0], device=dev, dtype=est_dtype)
+                spks = torch.randn(1, 80, device=dev, dtype=est_dtype)
+                cond = torch.zeros(1, 80, T, device=dev, dtype=est_dtype)
+                estimator.forward(x, mask=mask, mu=mu, t=t_val, spks=spks, cond=cond, r=r_val)
+                n_shapes += 1
+        torch.cuda.synchronize()
+        logger.info(f"  CFM decoder warmed up for {n_shapes} shapes in {time.time()-t_warmup_start:.1f}s")
+    except Exception as e:
+        logger.warning(f"  CFM decoder warmup failed (non-critical): {e}")
+
     elapsed = time.time() - t0
     logger.info(f"Warmup complete in {elapsed:.1f}s — kernels cached for production speed.")
 
