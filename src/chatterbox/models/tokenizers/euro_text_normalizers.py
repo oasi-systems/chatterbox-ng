@@ -80,8 +80,9 @@ def french_text_normalize(text: str) -> str:
         for pattern, replacement in _FRENCH_ABBREVIATIONS.items():
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
-        # 1b. Thousands separator: 425.000 → 425000
+        # 1b. Thousands separator: 425.000 → 425000, €1.250.000 → €1250000
         text = re.sub(r'\b(\d{1,3})(?:\.(\d{3}))+\b', lambda m: m.group(0).replace('.', ''), text)
+        text = re.sub(r'([€$£])\s?(\d{1,3}(?:\.\d{3})+)', lambda m: m.group(1) + m.group(2).replace('.', ''), text)
 
         # 2. Phone numbers
         def replace_phone(match):
@@ -97,13 +98,19 @@ def french_text_normalize(text: str) -> str:
         def _fr_currency(amount_str, symbol):
             names = {'€': 'euro', '$': 'dollar', '£': 'livre'}
             plurals = {'€': 'euros', '$': 'dollars', '£': 'livres'}
-            amount = int(amount_str)
+            clean = amount_str.replace('.', '')
+            if ',' in clean:
+                clean = clean.replace(',', '.')
+            try:
+                amount = int(float(clean))
+            except ValueError:
+                amount = 0
             words = num2words(amount, lang='fr')
             name = names.get(symbol, symbol) if amount <= 1 else plurals.get(symbol, symbol)
             return f"{words} {name}"
 
-        text = re.sub(r'(\d+)\s*([€$£])', lambda m: _fr_currency(m.group(1), m.group(2)), text)
-        text = re.sub(r'([€$£])\s*(\d+)', lambda m: _fr_currency(m.group(2), m.group(1)), text)
+        text = re.sub(r'(\d[\d.,]*)\s*([€$£])', lambda m: _fr_currency(m.group(1), m.group(2)), text)
+        text = re.sub(r'([€$£])\s*(\d[\d.,]*)', lambda m: _fr_currency(m.group(2), m.group(1)), text)
 
         # 4. Symbols
         for sym, rep in _FRENCH_SYMBOLS.items():
@@ -230,8 +237,9 @@ def german_text_normalize(text: str) -> str:
         for pattern, replacement in _GERMAN_ABBREVIATIONS.items():
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
-        # 1b. Thousands separator: 425.000 → 425000 (must be before dates/decimals)
+        # 1b. Thousands separator: 425.000 → 425000, €1.250.000 → €1250000
         text = re.sub(r'\b(\d{1,3})(?:\.(\d{3}))+\b', lambda m: m.group(0).replace('.', ''), text)
+        text = re.sub(r'([€$£])\s?(\d{1,3}(?:\.\d{3})+)', lambda m: m.group(1) + m.group(2).replace('.', ''), text)
 
         # 2. Phone numbers
         def replace_phone(match):
@@ -246,13 +254,19 @@ def german_text_normalize(text: str) -> str:
         # 3. Currency
         def _de_currency(amount_str, symbol):
             names = {'€': 'Euro', '$': 'Dollar', '£': 'Pfund'}
-            amount = int(amount_str)
+            clean = amount_str.replace('.', '')
+            if ',' in clean:
+                clean = clean.replace(',', '.')
+            try:
+                amount = int(float(clean))
+            except ValueError:
+                amount = 0
             words = num2words(amount, lang='de')
             name = names.get(symbol, symbol)
             return f"{words} {name}"
 
-        text = re.sub(r'(\d+)\s*([€$£])', lambda m: _de_currency(m.group(1), m.group(2)), text)
-        text = re.sub(r'([€$£])\s*(\d+)', lambda m: _de_currency(m.group(2), m.group(1)), text)
+        text = re.sub(r'(\d[\d.,]*)\s*([€$£])', lambda m: _de_currency(m.group(1), m.group(2)), text)
+        text = re.sub(r'([€$£])\s*(\d[\d.,]*)', lambda m: _de_currency(m.group(2), m.group(1)), text)
 
         # 4. Symbols
         for sym, rep in _GERMAN_SYMBOLS.items():
@@ -382,8 +396,9 @@ def spanish_text_normalize(text: str) -> str:
         for pattern, replacement in _SPANISH_ABBREVIATIONS.items():
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
-        # 1b. Thousands separator: 425.000 → 425000
+        # 1b. Thousands separator: 425.000 → 425000, €1.250.000 → €1250000
         text = re.sub(r'\b(\d{1,3})(?:\.(\d{3}))+\b', lambda m: m.group(0).replace('.', ''), text)
+        text = re.sub(r'([€$£])\s?(\d{1,3}(?:\.\d{3})+)', lambda m: m.group(1) + m.group(2).replace('.', ''), text)
 
         # 2. Phone numbers
         def replace_phone(match):
@@ -399,13 +414,19 @@ def spanish_text_normalize(text: str) -> str:
         def _es_currency(amount_str, symbol):
             names = {'€': 'euro', '$': 'dólar', '£': 'libra'}
             plurals = {'€': 'euros', '$': 'dólares', '£': 'libras'}
-            amount = int(amount_str)
+            clean = amount_str.replace('.', '')
+            if ',' in clean:
+                clean = clean.replace(',', '.')
+            try:
+                amount = int(float(clean))
+            except ValueError:
+                amount = 0
             words = num2words(amount, lang='es')
             name = names.get(symbol, symbol) if amount == 1 else plurals.get(symbol, symbol)
             return f"{words} {name}"
 
-        text = re.sub(r'(\d+)\s*([€$£])', lambda m: _es_currency(m.group(1), m.group(2)), text)
-        text = re.sub(r'([€$£])\s*(\d+)', lambda m: _es_currency(m.group(2), m.group(1)), text)
+        text = re.sub(r'(\d[\d.,]*)\s*([€$£])', lambda m: _es_currency(m.group(1), m.group(2)), text)
+        text = re.sub(r'([€$£])\s*(\d[\d.,]*)', lambda m: _es_currency(m.group(2), m.group(1)), text)
 
         # 4. Symbols
         for sym, rep in _SPANISH_SYMBOLS.items():
@@ -545,8 +566,9 @@ def portuguese_text_normalize(text: str) -> str:
         for pattern, replacement in _PORTUGUESE_ABBREVIATIONS.items():
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
-        # 1b. Thousands separator: 425.000 → 425000
+        # 1b. Thousands separator: 425.000 → 425000, €1.250.000 → €1250000
         text = re.sub(r'\b(\d{1,3})(?:\.(\d{3}))+\b', lambda m: m.group(0).replace('.', ''), text)
+        text = re.sub(r'([€$£])\s?(\d{1,3}(?:\.\d{3})+)', lambda m: m.group(1) + m.group(2).replace('.', ''), text)
 
         # 2. Phone numbers
         def replace_phone(match):
@@ -562,13 +584,19 @@ def portuguese_text_normalize(text: str) -> str:
         def _pt_currency(amount_str, symbol):
             names = {'€': 'euro', '$': 'dólar', '£': 'libra'}
             plurals = {'€': 'euros', '$': 'dólares', '£': 'libras'}
-            amount = int(amount_str)
+            clean = amount_str.replace('.', '')
+            if ',' in clean:
+                clean = clean.replace(',', '.')
+            try:
+                amount = int(float(clean))
+            except ValueError:
+                amount = 0
             words = num2words(amount, lang='pt')
             name = names.get(symbol, symbol) if amount == 1 else plurals.get(symbol, symbol)
             return f"{words} {name}"
 
-        text = re.sub(r'(\d+)\s*([€$£])', lambda m: _pt_currency(m.group(1), m.group(2)), text)
-        text = re.sub(r'([€$£])\s*(\d+)', lambda m: _pt_currency(m.group(2), m.group(1)), text)
+        text = re.sub(r'(\d[\d.,]*)\s*([€$£])', lambda m: _pt_currency(m.group(1), m.group(2)), text)
+        text = re.sub(r'([€$£])\s*(\d[\d.,]*)', lambda m: _pt_currency(m.group(2), m.group(1)), text)
 
         # 4. Symbols
         for sym, rep in _PORTUGUESE_SYMBOLS.items():
@@ -856,8 +884,11 @@ def italian_text_normalize(text: str) -> str:
         for pattern, replacement in _ITALIAN_ABBREVIATIONS.items():
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
-        # 1b. Thousands separator: 425.000 → 425000
+        # 1b. Thousands separator: 425.000 → 425000, €1.250.000 → €1250000
+        # Standard word-boundary version (handles "costa 1.250.000 euro")
         text = re.sub(r'\b(\d{1,3})(?:\.(\d{3}))+\b', lambda m: m.group(0).replace('.', ''), text)
+        # Currency-prefixed version (handles "€1.250.000" where \b fails after €)
+        text = re.sub(r'([€$£])\s?(\d{1,3}(?:\.\d{3})+)', lambda m: m.group(1) + m.group(2).replace('.', ''), text)
 
         # 2. Phone numbers
         def replace_phone(match):
@@ -873,15 +904,25 @@ def italian_text_normalize(text: str) -> str:
         def _it_currency(amount_str, symbol):
             names = {'€': 'euro', '$': 'dollaro', '£': 'sterlina'}
             plurals = {'€': 'euro', '$': 'dollari', '£': 'sterline'}
-            amount = int(amount_str)
+            # Safety: strip thousands separators that may have survived step 1b
+            clean = amount_str.replace('.', '')
+            # Handle Italian decimal comma: 1.250,50 → 1250.50
+            if ',' in clean:
+                clean = clean.replace(',', '.')
+            try:
+                amount = int(float(clean))
+            except ValueError:
+                amount = 0
             words = num2words(amount, lang='it')
             if amount == 1:
                 words = 'un'
             name = names.get(symbol, symbol) if amount == 1 else plurals.get(symbol, symbol)
             return f"{words} {name}"
 
-        text = re.sub(r'(\d+)\s*([€$£])', lambda m: _it_currency(m.group(1), m.group(2)), text)
-        text = re.sub(r'([€$£])\s*(\d+)', lambda m: _it_currency(m.group(2), m.group(1)), text)
+        # Currency after number: 250.000€ or 250000 €
+        text = re.sub(r'(\d[\d.,]*)\s*([€$£])', lambda m: _it_currency(m.group(1), m.group(2)), text)
+        # Currency before number: €250.000 or € 1250000
+        text = re.sub(r'([€$£])\s*(\d[\d.,]*)', lambda m: _it_currency(m.group(2), m.group(1)), text)
 
         # 4. Symbols
         for sym, rep in _ITALIAN_SYMBOLS.items():
