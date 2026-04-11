@@ -11,10 +11,11 @@ logger = logging.getLogger(__name__)
 
 try:
     from num2words import num2words
-    _HAS_NUM2WORDS = True
 except ImportError:
-    _HAS_NUM2WORDS = False
-    logger.warning("num2words not available - number normalization disabled")
+    raise ImportError(
+        "num2words is required for text normalization (numbers, currency, dates). "
+        "Install with: pip install num2words"
+    )
 
 
 # ============================================================================
@@ -73,8 +74,6 @@ _FRENCH_MONTHS = {
 
 def french_text_normalize(text: str) -> str:
     """French text normalization."""
-    if not _HAS_NUM2WORDS:
-        return text
     try:
         # 1. Abbreviations
         for pattern, replacement in _FRENCH_ABBREVIATIONS.items():
@@ -230,8 +229,6 @@ _GERMAN_MONTHS = {
 
 def german_text_normalize(text: str) -> str:
     """German text normalization."""
-    if not _HAS_NUM2WORDS:
-        return text
     try:
         # 1. Abbreviations
         for pattern, replacement in _GERMAN_ABBREVIATIONS.items():
@@ -389,8 +386,6 @@ _SPANISH_MONTHS = {
 
 def spanish_text_normalize(text: str) -> str:
     """Spanish text normalization."""
-    if not _HAS_NUM2WORDS:
-        return text
     try:
         # 1. Abbreviations
         for pattern, replacement in _SPANISH_ABBREVIATIONS.items():
@@ -559,8 +554,6 @@ _PORTUGUESE_MONTHS = {
 
 def portuguese_text_normalize(text: str) -> str:
     """Portuguese text normalization."""
-    if not _HAS_NUM2WORDS:
-        return text
     try:
         # 1. Abbreviations
         for pattern, replacement in _PORTUGUESE_ABBREVIATIONS.items():
@@ -718,8 +711,6 @@ _ENGLISH_MONTHS = {
 
 def english_text_normalize(text: str) -> str:
     """English text normalization."""
-    if not _HAS_NUM2WORDS:
-        return text
     try:
         # 1. Abbreviations
         for pattern, replacement in _ENGLISH_ABBREVIATIONS.items():
@@ -877,8 +868,6 @@ _ITALIAN_MONTHS = {
 
 def italian_text_normalize(text: str) -> str:
     """Italian text normalization."""
-    if not _HAS_NUM2WORDS:
-        return text
     try:
         # 1. Abbreviations
         for pattern, replacement in _ITALIAN_ABBREVIATIONS.items():

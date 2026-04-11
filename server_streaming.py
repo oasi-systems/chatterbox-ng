@@ -95,7 +95,9 @@ def create_app(model_type: str = "multilingual"):
     DEVICE = "cuda" if torch.cuda.is_available() else (
         "mps" if torch.backends.mps.is_available() else "cpu"
     )
-    SAMPLE_RATE = 24000
+    # Native sample rate (before resampling). The actual output rate depends
+    # on the streamer's output_sample_rate — see _get_streamer().
+    _NATIVE_SR = 24000
 
     # --- Model holder with thread-safe initialization ---
     _model = {"instance": None}
@@ -175,7 +177,7 @@ def create_app(model_type: str = "multilingual"):
             "repetition_penalty": params.get("repetition_penalty", 1.2),
             "exaggeration": params.get("exaggeration", 0.5),
             "cfg_weight": params.get("cfg_weight", 0.5),
-            "sentence_pipelining": params.get("sentence_pipelining", True),
+            "sentence_pipelining": params.get("sentence_pipelining", False),
         }
         if prompt_path:
             gen_kwargs["audio_prompt_path"] = prompt_path
@@ -248,9 +250,10 @@ def create_app(model_type: str = "multilingual"):
                 await websocket.close()
                 return
 
+            output_sr = params.get("output_sample_rate", 16000)
             await websocket.send_text(json.dumps({
                 "status": "generating",
-                "sample_rate": SAMPLE_RATE,
+                "sample_rate": output_sr,
                 "queue_position": _request_stats["queued"],
             }))
 
@@ -282,14 +285,16 @@ def create_app(model_type: str = "multilingual"):
         for key in ("temperature", "repetition_penalty", "exaggeration", "cfg_weight"):
             if key in params:
                 params[key] = float(params[key])
-        for key in ("chunk_tokens",):
+        for key in ("chunk_tokens", "output_sample_rate"):
             if key in params:
                 params[key] = int(params[key])
         if "sentence_pipelining" in params:
             params["sentence_pipelining"] = params["sentence_pipelining"].lower() in ("true", "1", "yes")
 
+        output_sr = params.get("output_sample_rate", 16000)
+
         async def event_generator():
-            meta = json.dumps({"sample_rate": SAMPLE_RATE})
+            meta = json.dumps({"sample_rate": output_sr})
             yield f"event: meta\ndata: {meta}\n\n"
 
             async for chunk in _generate_chunks_async(params):
@@ -420,7 +425,8 @@ def create_app(model_type: str = "multilingual"):
             "status": "ok",
             "model_type": model_type,
             "model_loaded": _model["instance"] is not None,
-            "sample_rate": SAMPLE_RATE,
+            "native_sample_rate": _NATIVE_SR,
+            "default_output_sample_rate": 16000,
             "features": {
                 "ssml": True,
                 "custom_dictionary": True,
