@@ -1,5 +1,44 @@
 # ChatterBox NG — Changelog
 
+## v0.5.1 — Critical Audio & Normalization Fixes (2026-04-11)
+
+> Fix critici: sample rate mismatch nel server, prosodia distrutta dal sentence pipelining,
+> normalizzazione numeri obbligatoria.
+
+### Sample Rate Mismatch (CRITICO)
+
+Il server comunicava `sample_rate: 24000` ai client, ma lo streamer produceva audio a 16kHz
+(default `output_sample_rate`). Risultato: playback 1.5x più veloce, pitch spostato, scatti.
+
+- Rimossa costante `SAMPLE_RATE = 24000` hardcoded
+- WebSocket e SSE ora comunicano il `output_sample_rate` effettivo del streamer
+- Health check riporta sia `native_sample_rate` (24kHz) che `default_output_sample_rate` (16kHz)
+- Aggiunto parsing `output_sample_rate` nei parametri SSE
+
+### Sentence Pipelining Default (CRITICO)
+
+Il server forzava `sentence_pipelining=True`, ma il metodo `generate_stream()` ha default `False`.
+Con pipelining attivo, ogni frase veniva processata da T3 indipendentemente — perdendo tutto
+il contesto prosodico inter-frase.
+
+- Default cambiato a `False` nel server
+- Il client può comunque attivarlo esplicitamente se necessario
+
+### num2words Obbligatorio (CRITICO)
+
+Se `num2words` non era installato, il normalizzatore saltava silenziosamente tutta la
+normalizzazione (numeri, valute, date, orari, ordinali) — mandando testo grezzo al modello.
+
+- Import ora fa `raise ImportError` se `num2words` manca — fail-fast all'avvio
+- Rimossi tutti i 6 guard `_HAS_NUM2WORDS` (codice morto)
+- `num2words>=0.5.13` è già in `pyproject.toml` dependencies
+
+### Currency Normalization Fix
+
+- Fix corruzione numeri nella normalizzazione valuta per tutte le 6 lingue europee
+
+---
+
 ## v0.5.0 — Codebase Cleanup, G2P Integration, Text Normalizer Fixes (2026-04-09)
 
 > Rimosso tutto il codice morto (~3000 righe), fix critici nei text normalizer,

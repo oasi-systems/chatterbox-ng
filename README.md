@@ -152,7 +152,7 @@ async def synthesize(text, language="it", ref_audio_b64=None):
             # "cfg_weight": 0.5,
             # "output_sample_rate": 16000,
             # "chunk_tokens": 25,
-            # "sentence_pipelining": true,
+            # "sentence_pipelining": false,
         }))
 
         # 2. Receive chunks
