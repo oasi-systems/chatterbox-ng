@@ -154,13 +154,15 @@ class AlignmentStreamAnalyzer:
             if len(self.generated_tokens) > 8:
                 self.generated_tokens = self.generated_tokens[-8:]
             
-        # Check for excessive token repetition (4x same token in a row)
-        # NOTE: threshold was 2 in original code, but 2 is too aggressive for
-        # languages with geminate consonants (Italian, Japanese, etc.) where
-        # 2 consecutive identical tokens are normal speech patterns.
+        # Check for excessive token repetition (6x same token in a row)
+        # NOTE: threshold was 2 in original code, raised to 4, now 6.
+        # 4 was too aggressive — languages with geminate consonants (Italian,
+        # Japanese) and short phrases often produce 4 identical tokens as normal
+        # speech (e.g. token 6405 in "risentiLa"). 6 gives the model room to
+        # recover naturally while still catching true degenerate loops.
         token_repetition = (
-            len(self.generated_tokens) >= 4 and
-            len(set(self.generated_tokens[-4:])) == 1
+            len(self.generated_tokens) >= 6 and
+            len(set(self.generated_tokens[-6:])) == 1
         )
 
         if token_repetition:
