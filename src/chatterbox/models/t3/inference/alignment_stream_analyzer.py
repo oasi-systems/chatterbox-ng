@@ -167,7 +167,7 @@ class AlignmentStreamAnalyzer:
 
         if token_repetition:
             repeated_token = self.generated_tokens[-1]
-            logger.warning(f"Detected 4x repetition of token {repeated_token}")
+            logger.warning(f"Detected 6x repetition of token {repeated_token}")
             
         # Suppress EoS to prevent early termination
         if cur_text_posn < S - 3 and S > 5:  # Only suppress if text is longer than 5 tokens
