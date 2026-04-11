@@ -19,6 +19,7 @@ Sentence pipelining mode:
 import logging
 import os
 import re as _re
+import threading
 from typing import Generator, Tuple, Union, Optional, List
 
 import numpy as np
@@ -170,6 +171,8 @@ class ChatterboxStreamingTTS:
         self.model = model
         self.chunk_tokens = chunk_tokens
         self.min_initial_tokens = min_initial_tokens
+        # Barge-in cancellation: external code calls cancel() to stop generation
+        self._cancel_event = threading.Event()
         self.adaptive_chunking = adaptive_chunking
         if adaptive_schedule is not None:
             self.adaptive_schedule = tuple(adaptive_schedule)
@@ -227,6 +230,19 @@ class ChatterboxStreamingTTS:
 
     def _is_multilingual(self):
         return hasattr(self.model, 'tokenizer') and hasattr(self.model.tokenizer, 'cangjie_converter')
+
+    def cancel(self):
+        """Cancel the current generation immediately (barge-in support).
+
+        Thread-safe. Can be called from any thread while generate_stream() is running.
+        The generator will stop at the next token boundary (~14-20ms latency).
+        """
+        self._cancel_event.set()
+
+    @property
+    def is_cancelled(self) -> bool:
+        """Check if a cancellation has been requested."""
+        return self._cancel_event.is_set()
 
     def _load_breath_templates(self):
         """Lazy-load breath templates from the built-in directory."""
@@ -384,6 +400,7 @@ class ChatterboxStreamingTTS:
             return
 
         self._all_chunks = []
+        self._cancel_event.clear()
         # Reset humanizer state for new utterance
         self._cumulative_speech_s = 0.0
         self._last_breath_time_s = -999.0
@@ -424,6 +441,10 @@ class ChatterboxStreamingTTS:
         chunk_index = 0  # tracks which chunk we're building (for adaptive schedule)
 
         for token in token_gen:
+            if self._cancel_event.is_set():
+                logger.info("Generation cancelled (barge-in)")
+                return
+
             token_val = token.view(-1)
             if token_val.item() < SPEECH_VOCAB_SIZE:
                 accumulated_tokens.append(token_val)
@@ -438,6 +459,8 @@ class ChatterboxStreamingTTS:
                 chunk_index += 1
 
         # --- Final chunk with finalize=True ---
+        if self._cancel_event.is_set():
+            return
         if len(accumulated_tokens) > 0:
             audio_chunk = self._emit_chunk(accumulated_tokens, stream_state, finalize=True, n_cfm_timesteps=n_cfm_timesteps)
             if audio_chunk is not None:
@@ -465,6 +488,7 @@ class ChatterboxStreamingTTS:
         - Natural sentence boundaries produce cleaner prosody
         """
         self._all_chunks = []
+        self._cancel_event.clear()
         # Reset humanizer state for new utterance
         self._cumulative_speech_s = 0.0
         self._last_breath_time_s = -999.0
@@ -493,6 +517,10 @@ class ChatterboxStreamingTTS:
             yield initial_breath
 
         for sent_idx, sentence in enumerate(sentences):
+            if self._cancel_event.is_set():
+                logger.info("Pipelined generation cancelled (barge-in)")
+                return
+
             is_last_sentence = (sent_idx == len(sentences) - 1)
 
             # Tokenize this sentence
@@ -509,6 +537,10 @@ class ChatterboxStreamingTTS:
             tokens_since_last_emit = 0
 
             for token in token_gen:
+                if self._cancel_event.is_set():
+                    logger.info("Pipelined generation cancelled (barge-in)")
+                    return
+
                 token_val = token.view(-1)
                 if token_val.item() < SPEECH_VOCAB_SIZE:
                     sentence_tokens.append(token_val)
@@ -525,6 +557,8 @@ class ChatterboxStreamingTTS:
                     tokens_since_last_emit = 0
 
             # Finalize this sentence's tokens
+            if self._cancel_event.is_set():
+                return
             if len(sentence_tokens) > 0:
                 finalize = is_last_sentence
                 audio_chunk = self._emit_chunk(
@@ -561,6 +595,7 @@ class ChatterboxStreamingTTS:
         from .ssml import parse_ssml
 
         self._all_chunks = []
+        self._cancel_event.clear()
         self._cumulative_speech_s = 0.0
         self._last_breath_time_s = -999.0
         self._audio_emitted_s = 0.0
@@ -588,6 +623,10 @@ class ChatterboxStreamingTTS:
             yield initial_breath
 
         for seg_idx, seg in enumerate(segments):
+            if self._cancel_event.is_set():
+                logger.info("SSML generation cancelled (barge-in)")
+                return
+
             is_last = (seg_idx == len(segments) - 1)
 
             # --- Break: emit silence ---
@@ -636,6 +675,10 @@ class ChatterboxStreamingTTS:
             chunk_index = 0
 
             for token in token_gen:
+                if self._cancel_event.is_set():
+                    logger.info("SSML generation cancelled (barge-in)")
+                    return
+
                 token_val = token.view(-1)
                 if token_val.item() < SPEECH_VOCAB_SIZE:
                     segment_tokens.append(token_val)
@@ -653,6 +696,8 @@ class ChatterboxStreamingTTS:
                     chunk_index += 1
 
             # Finalize this segment
+            if self._cancel_event.is_set():
+                return
             if len(segment_tokens) > 0:
                 audio_chunk = self._emit_chunk(
                     segment_tokens, stream_state,
