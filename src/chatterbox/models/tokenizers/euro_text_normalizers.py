@@ -965,7 +965,26 @@ def italian_text_normalize(text: str) -> str:
                 return match.group(0)
         text = re.sub(r'(\d+),(\d+)', replace_decimal, text)
 
-        # 10. Cardinal numbers
+        # 10a. Hybrid number forms: 220mila, 1milione, 2miliardi
+        def _it_hybrid_number(match):
+            num_part = match.group(1)
+            suffix = match.group(2).lower()
+            multipliers = {
+                'mila': 1000, 'k': 1000,
+                'milione': 1000000, 'milioni': 1000000, 'mln': 1000000,
+                'miliardo': 1000000000, 'miliardi': 1000000000, 'mld': 1000000000,
+            }
+            mult = multipliers.get(suffix, 1)
+            try:
+                return num2words(int(num_part) * mult, lang='it')
+            except Exception:
+                return match.group(0)
+        text = re.sub(
+            r'\b(\d+)\s*(mila|milione|milioni|miliardo|miliardi|mln|mld|k)\b',
+            _it_hybrid_number, text, flags=re.IGNORECASE,
+        )
+
+        # 10b. Cardinal numbers
         text = re.sub(r'\b\d+\b', lambda m: num2words(int(m.group(0)), lang='it'), text)
 
         # 10. Prosody
