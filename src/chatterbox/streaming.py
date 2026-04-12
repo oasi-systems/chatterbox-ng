@@ -421,6 +421,12 @@ class ChatterboxStreamingTTS:
         # --- Tokenize text ---
         text_tokens = self._tokenize_text(text, language_id, device)
 
+        # --- Build word boundary map for alignment-aware chunking ---
+        # Find positions in text_tokens where [SPACE] occurs — these are word boundaries.
+        # Chunk emission waits for the model to cross a word boundary, preventing
+        # words from being split across chunks (which corrupts consonant clusters).
+        space_positions = self._find_space_positions(text_tokens)
+
         # --- Initialize streaming state (seed HiFiGAN from reference audio) ---
         stream_state = self.model.s3gen.init_streaming(ref_dict=self.model.conds.gen)
         accumulated_tokens = []
@@ -439,6 +445,7 @@ class ChatterboxStreamingTTS:
         # --- Stream tokens and emit audio chunks ---
         tokens_since_last_emit = 0
         chunk_index = 0  # tracks which chunk we're building (for adaptive schedule)
+        last_emit_text_pos = -1  # text position at last chunk emission
 
         for token in token_gen:
             if self._cancel_event.is_set():
@@ -452,11 +459,22 @@ class ChatterboxStreamingTTS:
 
             threshold = self._get_chunk_threshold(chunk_index, stream_state.is_first_chunk)
             if tokens_since_last_emit >= threshold and len(accumulated_tokens) > 0:
-                audio_chunk = self._emit_chunk(accumulated_tokens, stream_state, finalize=False, n_cfm_timesteps=n_cfm_timesteps)
-                if audio_chunk is not None:
-                    yield audio_chunk
-                tokens_since_last_emit = 0
-                chunk_index += 1
+                # Word-boundary aligned chunking: wait until the model has crossed
+                # a word boundary before emitting. This prevents splitting words
+                # across chunks, which corrupts pronunciation of consonant clusters.
+                # Safety: emit anyway after threshold + 10 tokens (avoid blocking
+                # on very long words or alignment glitches).
+                at_word_boundary = self._at_word_boundary(space_positions, last_emit_text_pos)
+                past_safety = tokens_since_last_emit >= threshold + 10
+
+                if at_word_boundary or past_safety:
+                    # Track text position at emission for next boundary check
+                    last_emit_text_pos = self._get_text_position()
+                    audio_chunk = self._emit_chunk(accumulated_tokens, stream_state, finalize=False, n_cfm_timesteps=n_cfm_timesteps)
+                    if audio_chunk is not None:
+                        yield audio_chunk
+                    tokens_since_last_emit = 0
+                    chunk_index += 1
 
         # --- Final chunk with finalize=True ---
         if self._cancel_event.is_set():
@@ -733,6 +751,60 @@ class ChatterboxStreamingTTS:
         if chunk_index < len(self.adaptive_schedule):
             return self.adaptive_schedule[chunk_index]
         return self.chunk_tokens
+
+    def _find_space_positions(self, text_tokens: torch.Tensor) -> set:
+        """Find positions of [SPACE] tokens in the text token sequence.
+
+        Returns a set of indices where word boundaries occur.
+        Used by word-boundary aligned chunking to prevent splitting words.
+        """
+        try:
+            vocab = self.model.tokenizer.tokenizer.get_vocab()
+            space_id = vocab.get("[SPACE]")
+            if space_id is None:
+                return set()
+            # text_tokens shape: (1, T) — includes SOT/EOT padding
+            tokens = text_tokens.squeeze(0).cpu().tolist()
+            return {i for i, tok in enumerate(tokens) if tok == space_id}
+        except Exception:
+            return set()
+
+    def _get_text_position(self) -> int:
+        """Get current text alignment position from T3's alignment analyzer.
+
+        Returns the text token index that the model is currently generating
+        speech for, or -1 if not available.
+        """
+        try:
+            analyzer = self.model.t3.patched_model.alignment_stream_analyzer
+            if analyzer is not None:
+                return int(analyzer.text_position)
+        except (AttributeError, RuntimeError):
+            pass
+        return -1
+
+    def _at_word_boundary(self, space_positions: set, last_emit_text_pos: int) -> bool:
+        """Check if the model has crossed a word boundary since last emission.
+
+        A word boundary is crossed when text_position has moved past a [SPACE]
+        token since the last chunk was emitted. This means the model has
+        finished generating speech for a complete word.
+
+        Falls back to True (emit freely) if alignment info is unavailable.
+        """
+        if not space_positions:
+            return True  # no space info — emit freely (non-multilingual or error)
+
+        current_pos = self._get_text_position()
+        if current_pos < 0:
+            return True  # alignment unavailable — emit freely
+
+        # Check if any space position falls between last_emit_text_pos and current_pos
+        for sp in space_positions:
+            if last_emit_text_pos < sp <= current_pos:
+                return True
+
+        return False
 
     def _emit_chunk(
         self,
