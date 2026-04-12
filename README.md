@@ -15,7 +15,10 @@ Optimized for production telephony (Asterisk, WebSocket) with voice cloning in 2
 - **Custom dictionary API** — runtime pronunciation CRUD via REST
 - **Concurrent requests** — asyncio.Lock serialized GPU access, thread pool offload
 - **Voice humanizer** — natural breathing sounds inserted in real-time
-- **16kHz output** — telephony-ready (Asterisk/G.711), with native 24kHz option
+- **LoRA fine-tuning** — Italian voice quality via merged LoRA adapters (zero runtime overhead)
+- **Word-boundary chunking** — streaming chunks aligned to word boundaries, prevents pronunciation corruption
+- **Barge-in cancellation** — thread-safe cancel() stops generation in <20ms
+- **16kHz output** — telephony-ready (Asterisk/G.722), with native 24kHz option
 - **CUDA optimized** — BF16, Flash Attention/SDPA, TF32, CFM decoder warmup
 
 ## Installation

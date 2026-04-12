@@ -1,5 +1,40 @@
 # ChatterBox NG — Changelog
 
+## v0.6.0 — LoRA Italian, Word-Boundary Chunking, Barge-In (2026-04-12)
+
+> LoRA fine-tuning per italiano, streaming allineato ai confini parola,
+> cancellazione barge-in, jitter buffer per telefonia.
+
+### LoRA Fine-Tuning Italian
+
+- Training pipeline completo: segment → denoise → transcribe → tokenize → train
+- Dataset: 57 min di parlato conversazionale italiano (2 speaker, CC0 LibriVox)
+- LoRA rank=64, 45M parametri trainabili su 581M (8.2%)
+- Merged into base weights via `merge_and_unload()` — zero overhead runtime
+- Risultato: pronuncia perfetta, token repetition ridotto del 70%
+
+### Word-Boundary Aligned Chunking
+
+- Chunk emission ora attende che il modello superi un confine `[SPACE]` nel testo
+- Usa `AlignmentStreamAnalyzer.text_position` per tracciare l'allineamento testo→speech
+- Previene la corruzione di cluster consonantici (es. "sentirla" → "sentiLa")
+- Safety: emette comunque dopo threshold+10 token per evitare blocchi
+- Fallback trasparente se alignment non disponibile
+
+### Barge-In Cancellation
+
+- `cancel()` + `threading.Event` su `ChatterboxStreamingTTS`
+- Thread-safe, stop al prossimo token boundary (~14-20ms)
+- Copre tutti e 3 i path: singolo, pipelined, SSML
+
+### Token Repetition
+
+- Soglia ripetizione alzata 4→6 per lingue con consonanti geminate
+- `num2words` obbligatorio — fail-fast all'import se mancante
+- Sample rate fix: il server comunica il rate effettivo al client
+
+---
+
 ## v0.5.1 — Critical Audio & Normalization Fixes (2026-04-11)
 
 > Fix critici: sample rate mismatch nel server, prosodia distrutta dal sentence pipelining,
