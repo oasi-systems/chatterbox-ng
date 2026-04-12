@@ -784,11 +784,17 @@ class ChatterboxStreamingTTS:
         return -1
 
     def _at_word_boundary(self, space_positions: set, last_emit_text_pos: int) -> bool:
-        """Check if the model has crossed a word boundary since last emission.
+        """Check if the model is currently AT a word boundary.
 
-        A word boundary is crossed when text_position has moved past a [SPACE]
-        token since the last chunk was emitted. This means the model has
-        finished generating speech for a complete word.
+        A word boundary means current_pos is exactly on a [SPACE] token or
+        on the token immediately after a [SPACE] (i.e., the first character
+        of the next word). This ensures the PREVIOUS word is fully generated
+        before we emit the chunk.
+
+        The old logic checked if any SPACE existed in the range — this was
+        wrong because it would emit mid-word if a SPACE existed earlier in
+        the range (e.g., "risentiLa" would split at "risenti" + "La" because
+        the SPACE before "risentiLa" was in the range).
 
         Falls back to True (emit freely) if alignment info is unavailable.
         """
@@ -799,10 +805,12 @@ class ChatterboxStreamingTTS:
         if current_pos < 0:
             return True  # alignment unavailable — emit freely
 
-        # Check if any space position falls between last_emit_text_pos and current_pos
-        for sp in space_positions:
-            if last_emit_text_pos < sp <= current_pos:
-                return True
+        # Current position must be ON a space or immediately after one.
+        # This means the model just finished a word boundary.
+        if current_pos in space_positions:
+            return True
+        if (current_pos - 1) in space_positions:
+            return True
 
         return False
 
