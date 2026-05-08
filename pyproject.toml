@@ -44,8 +44,9 @@ onnxruntime = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/resemble-ai/chatterbox"
-Repository = "https://github.com/resemble-ai/chatterbox"
+Homepage = "https://github.com/oasi-systems/chatterbox-ng"
+Repository = "https://github.com/oasi-systems/chatterbox-ng"
+Upstream = "https://github.com/resemble-ai/chatterbox"
 
 [build-system]
 requires = ["setuptools>=61.0"]

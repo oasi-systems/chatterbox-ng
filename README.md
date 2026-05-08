@@ -24,7 +24,7 @@ Optimized for production telephony (Asterisk, WebSocket) with voice cloning in 2
 ## Installation
 
 ```shell
-git clone https://github.com/scalcerano/chatterbox-ng.git
+git clone https://github.com/oasi-systems/chatterbox-ng.git
 cd chatterbox-ng
 pip install -e .
 ```
